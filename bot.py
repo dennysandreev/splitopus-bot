@@ -1,186 +1,71 @@
-import requests
-import json
 import time
-import os
+import logging
 import random
-import string
+import os
 from datetime import datetime
 
+# Import modules from src
+from src import data, logic
+from src.telegram import TelegramClient
+
 # --- Configuration ---
+# TODO: Move token to .env environment variable for security
 TOKEN = "8228071414:AAG31gr_raDybAdi_kNkyGZ8mpzBkiZX0VU"
-BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
-DATA_DIR = "skills/thai_split_bot/data"
-USERS_FILE = f"{DATA_DIR}/users.json"
-TRIPS_FILE = f"{DATA_DIR}/trips.json"
-DRAFTS_FILE = f"{DATA_DIR}/drafts.json"
 
-CATEGORIES = {
-    "FOOD": "🍔 Еда",
-    "ALCOHOL": "🍺 Алкоголь",
-    "TRANSPORT": "🚕 Транспорт",
-    "SHOP": "🛒 Магазин",
-    "FUN": "🎉 Развлечения",
-    "HOME": "🏠 Жилье",
-    "REPAYMENT": "💸 Возврат долга",
-    "OTHER": "📦 Другое"
-}
+# --- Logging Setup ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-CURRENCIES = {
-    "THB": "🇹🇭 THB",
-    "RUB": "🇷🇺 RUB",
-    "USD": "🇺🇸 USD",
-    "EUR": "🇪🇺 EUR",
-    "AED": "🇦🇪 AED",
-    "CUSTOM": "✏️ Своя"
-}
+# --- Initialize Client ---
+bot = TelegramClient(TOKEN)
 
-# --- Database ---
-def load_json(path):
-    if os.path.exists(path):
-        with open(path, 'r') as f: return json.load(f)
-    return {}
+# --- Helper Functions ---
+def notify_others(tid, payer_id, amount, desc, category, split_map):
+    trip = data.get_trip(tid)
+    if not trip: return
 
-def save_json(path, data):
-    with open(path, 'w') as f: json.dump(data, f, indent=2, ensure_ascii=False)
-
-# --- Logic ---
-def generate_trip_code():
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-
-def get_trip(trip_id):
-    trips = load_json(TRIPS_FILE)
-    return trips.get(trip_id)
-
-def get_active_trip_id(user_id):
-    users = load_json(USERS_FILE)
-    return users.get(str(user_id), {}).get('active_trip_id')
-
-def calculate_balance(trip_id):
-    trip = get_trip(trip_id)
-    if not trip: return {}, 0, {} # Added return for empty dict for total_paid_by_member
+    payer = data.get_user(payer_id)
+    payer_name = payer.get('name', 'User') if payer else 'User'
     
-    balances = {uid: 0.0 for uid in trip['members']}
-    total_spent_on_trip = 0.0 # Renamed for clarity
-    total_paid_by_member = {uid: 0.0 for uid in trip['members']} # New dictionary
+    curr = trip.get('currency', 'THB')
+    rate = trip.get('rate', 0)
     
-    for exp in trip['expenses']:
-        cat = exp.get('category', 'OTHER')
-        payer = str(exp['payer_id'])
-        amount = float(exp['amount'])
-        
-        # Total amount spent on trip's common needs
-        if cat != "REPAYMENT":
-            total_spent_on_trip += amount
-        
-        # Total amount each member contributed to the system (including debts they lent)
-        if payer in total_paid_by_member: # Check if payer is a valid member
-            total_paid_by_member[payer] += amount
-        
-        split = exp['split']
-        if payer in balances: balances[payer] += amount # Ensure payer is in balances
-        for uid, share in split.items():
-            if str(uid) in balances: balances[str(uid)] -= share # Ensure uid is in balances
-            
-    return balances, total_spent_on_trip, total_paid_by_member # Changed return values
-
-def get_my_stats(trip_id, my_uid):
-    trip = get_trip(trip_id)
-    if not trip: return {}
+    markup = {"inline_keyboard": [[{"text": "📊 Мой Баланс", "callback_data": "SHOW_MY_BALANCE"}]]}
     
-    stats = {"total_share": 0.0, "cats": {}, "my_repayments": [], "received_repayments": []}
-    my_uid = str(my_uid)
-    
-    for exp in trip['expenses']:
-        cat = exp.get('category', 'OTHER')
-        payer = str(exp['payer_id'])
-        amount = float(exp['amount'])
-        desc = exp.get('desc', 'Расход') # Added for detail
-        
-        if cat == "REPAYMENT":
-            # I repaid a debt
-            if payer == my_uid:
-                target_uid = list(exp['split'].keys())[0]
-                stats["my_repayments"].append({"to": target_uid, "amount": amount, "ts": exp['ts']})
-            # Debt was repaid to me
-            elif my_uid in exp['split']:
-                stats["received_repayments"].append({"from": payer, "amount": amount, "ts": exp['ts']})
-            continue # Skip REPAYMENT for regular expenses
-        
-        split = exp.get('split', {})
-        my_share = split.get(my_uid, 0.0)
-        
-        if my_share > 0:
-            stats["total_share"] += my_share
-            stats["cats"][cat] = stats["cats"].get(cat, 0.0) + my_share
-            
-    return stats
+    for uid in trip['members']:
+        uid_str = str(uid)
+        if uid_str != str(payer_id):
+            my_share = split_map.get(uid_str, 0)
+            if my_share > 0:
+                share_text = f"*{my_share:.0f} {curr}*"
+                if rate > 0: share_text += f" (~{my_share*rate:.0f} RUB)"
+                
+                title = "🧾 Новый Расход"
+                if category == "REPAYMENT": title = "💸 Возврат Долга"
+                
+                msg = (
+                    f"{title}\n"
+                    f"👤 *{payer_name}* -> *{amount:,.0f} {curr}*\n"
+                    f"📝 {desc}\n"
+                    f"📉 {share_text}"
+                )
+                bot.send_message(uid_str, msg, reply_markup=markup)
 
-def simplify_debts(balances, user_names):
-    creditors = []
-    debtors = []
-    for uid, bal in balances.items():
-        if bal > 0.01: creditors.append({'id': uid, 'amount': bal})
-        if bal < -0.01: debtors.append({'id': uid, 'amount': -bal})
-    creditors.sort(key=lambda x: x['amount'], reverse=True)
-    debtors.sort(key=lambda x: x['amount'], reverse=True)
-    transactions = []
-    i = 0
-    j = 0
-    while i < len(debtors) and j < len(creditors):
-        debtor = debtors[i]
-        creditor = creditors[j]
-        amount = min(debtor['amount'], creditor['amount'])
-        transactions.append({
-            'from': user_names.get(debtor['id'], debtor['id']),
-            'to': user_names.get(creditor['id'], creditor['id']),
-            'amount': amount
-        })
-        debtor['amount'] -= amount
-        creditor['amount'] -= amount
-        if debtor['amount'] < 0.01: i += 1
-        if creditor['amount'] < 0.01: j += 1
-    return transactions
-
-# --- Telegram API ---
-def send_message(chat_id, text, reply_markup=None):
-    url = f"{BASE_URL}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup: payload['reply_markup'] = json.dumps(reply_markup)
-    try: requests.post(url, json=payload)
-    except: pass
-
-def edit_message(chat_id, message_id, text, reply_markup=None):
-    url = f"{BASE_URL}/editMessageText"
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup: payload['reply_markup'] = json.dumps(reply_markup)
-    try: requests.post(url, json=payload)
-    except: pass
-
-def send_document(chat_id, file_path):
-    url = f"{BASE_URL}/sendDocument"
-    try:
-        with open(file_path, 'rb') as f:
-            requests.post(url, data={"chat_id": chat_id}, files={"document": f})
-    except: pass
-
-def get_updates(offset=None):
-    url = f"{BASE_URL}/getUpdates"
-    params = {"timeout": 1, "offset": offset}
-    try:
-        resp = requests.get(url, params=params, timeout=5).json()
-        return resp.get("result", [])
-    except: return []
-
-# --- Handlers ---
 def send_trip_dashboard(chat_id, user_id, message_id=None):
-    users = load_json(USERS_FILE)
-    trips = load_json(TRIPS_FILE)
-    tid = users.get(str(user_id), {}).get('active_trip_id')
+    uid_str = str(user_id)
+    tid = data.get_active_trip_id(uid_str)
+    trip = data.get_trip(tid)
     
-    if not tid or tid not in trips:
+    if not tid or not trip:
         return handle_command(chat_id, user_id, "User", "/start") 
         
-    trip = trips[tid]
     name = trip.get('name', 'Trip')
     code = trip.get('code')
     
@@ -205,237 +90,82 @@ def send_trip_dashboard(chat_id, user_id, message_id=None):
     }
     
     if message_id:
-        edit_message(chat_id, message_id, msg, reply_markup=keyboard)
+        bot.edit_message(chat_id, message_id, msg, reply_markup=keyboard)
     else:
-        send_message(chat_id, msg, reply_markup=keyboard)
+        bot.send_message(chat_id, msg, reply_markup=keyboard)
 
-def send_all_expenses_list(chat_id, user_id, message_id=None, page=0):
-    users = load_json(USERS_FILE)
-    trips = load_json(TRIPS_FILE)
-    tid = users.get(str(user_id), {}).get('active_trip_id')
+def send_category_menu(chat_id, draft_id, curr, message_id=None):
+    keyboard = []
+    row = []
+    for key, label in logic.CATEGORIES.items():
+        if key == "REPAYMENT": continue
+        row.append({"text": label, "callback_data": f"CAT|{draft_id}|{label}"})
+        if len(row) == 2: keyboard.append(row); row = []
+    if row: keyboard.append(row)
+    
+    draft = data.get_draft(draft_id)
+    if not draft: return
 
-    if not tid or tid not in trips:
-        return send_message(chat_id, "Нет активной поездки.")
+    amount = draft['amount']
+    desc = draft['desc']
+    text = f"💸 *{amount} {curr}* ({desc})\n🏷 Выберите категорию:"
+    markup = {"inline_keyboard": keyboard}
+    
+    if message_id: bot.edit_message(chat_id, message_id, text, reply_markup=markup)
+    else: bot.send_message(chat_id, text, reply_markup=markup)
 
-    trip = trips[tid]
-    expenses = sorted(trip.get('expenses', []), key=lambda x: x['ts'], reverse=True) # Sort by date, newest first
+def send_split_menu(chat_id, draft_id, message_id=None):
+    draft = data.get_draft(draft_id)
+    if not draft: return
+    
+    trip = data.get_trip(draft['trip_id'])
     curr = trip.get('currency', 'THB')
-    names = {uid: users.get(uid, {}).get('name', 'Unknown') for uid in trip['members']}
-
-    PAGE_SIZE = 10 # Number of expenses per page
-    total_pages = (len(expenses) + PAGE_SIZE - 1) // PAGE_SIZE
     
-    start_idx = page * PAGE_SIZE
-    end_idx = min(start_idx + PAGE_SIZE, len(expenses))
+    amount = draft['amount']
+    desc = draft['desc']
+    cat = draft.get('category', '')
+    selected = draft['selected']
     
-    if not expenses:
-        msg = "📝 В этой поездке пока нет трат."
-        keyboard = {"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]}
-        if message_id: edit_message(chat_id, message_id, msg, reply_markup=keyboard)
-        else: send_message(chat_id, msg, reply_markup=keyboard)
-        return
-
-    msg = f"🧾 *Все траты ({trip.get('name')}):*\n\n"
+    keyboard = []
+    row = []
     
-    for i in range(start_idx, end_idx):
-        exp = expenses[i]
-        date = datetime.fromtimestamp(exp['ts']).strftime('%d.%m %H:%M')
-        payer_name = names.get(str(exp['payer_id']), 'Unknown')
-        amount = exp['amount']
-        desc = exp.get('desc', 'Без описания')
-        category_label = CATEGORIES.get(exp.get('category', 'OTHER'), exp.get('category', 'Другое'))
-        
-        # Only for regular expenses, not debt repayment
-        if exp.get('category') != "REPAYMENT":
-             msg += (
-                f"*{date}* ({category_label})\n"
-                f"👤 {payer_name} потратил: *{amount:,.0f} {curr}*\n"
-                f"📝 {desc}\n\n"
-            )
-        else:
-            # For debt repayment, show "Who repaid whom"
-            repay_from_name = names.get(str(exp['payer_id']), 'Unknown')
-            repay_to_id = list(exp['split'].keys())[0] # Get ID of recipient
-            repay_to_name = names.get(str(repay_to_id), 'Unknown')
-            msg += (
-                f"*{date}* ({category_label})\n"
-                f"💸 {repay_from_name} вернул {repay_to_name}: *{amount:,.0f} {curr}*\n\n"
-            )
-
-
-    keyboard_rows = []
-    nav_row = []
-
-    if page > 0:
-        nav_row.append({"text": "◀️ Назад", "callback_data": f"ALL_EXPENSES_PAGE|{page-1}"})
-    if page < total_pages - 1:
-        nav_row.append({"text": "Вперед ▶️", "callback_data": f"ALL_EXPENSES_PAGE|{page+1}"})
+    # Load all users to get names
+    users_db = data.load_json(data.USERS_FILE)
     
-    if nav_row:
-        keyboard_rows.append(nav_row)
-
-    keyboard_rows.append([{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}])
+    for uid, is_active in selected.items():
+        u_name = users_db.get(str(uid), {}).get('name', 'Unknown')
+        status = "✅" if is_active else "⬜️"
+        row.append({"text": f"{status} {u_name}", "callback_data": f"TOGGLE|{draft_id}|{uid}"})
+        if len(row) == 2: keyboard.append(row); row = []
+    if row: keyboard.append(row)
     
-    keyboard = {"inline_keyboard": keyboard_rows}
-
-    if message_id:
-        edit_message(chat_id, message_id, msg, reply_markup=keyboard)
-    else:
-        send_message(chat_id, msg, reply_markup=keyboard)
-
-def send_recent_expenses(chat_id, user_id, message_id=None):
-    users = load_json(USERS_FILE)
-    trips = load_json(TRIPS_FILE)
-    tid = users.get(str(user_id), {}).get('active_trip_id')
-
-    if not tid or tid not in trips:
-        return send_message(chat_id, "Нет активной поездки.")
-
-    trip = trips[tid]
-    # Get the last 10 expenses, sorted by timestamp (newest first)
-    recent_expenses = sorted(trip.get('expenses', []), key=lambda x: x['ts'], reverse=True)[:10]
-    curr = trip.get('currency', 'THB')
-    names = {uid: users.get(uid, {}).get('name', 'Unknown') for uid in trip['members']}
-
-    if not recent_expenses:
-        msg = "📝 Пока нет недавних трат в этой поездке."
-        keyboard = {"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]}
-        if message_id: edit_message(chat_id, message_id, msg, reply_markup=keyboard)
-        else: send_message(chat_id, msg, reply_markup=keyboard)
-        return
-
-    msg = f"📜 *Последние 10 трат ({trip.get('name')}):*\n\n"
+    count = sum(1 for v in selected.values() if v)
+    share = amount / count if count > 0 else 0
     
-    for exp in recent_expenses:
-        date = datetime.fromtimestamp(exp['ts']).strftime('%d.%m %H:%M')
-        payer_name = names.get(str(exp['payer_id']), 'Unknown')
-        amount = exp['amount']
-        desc = exp.get('desc', 'Без описания')
-        category_label = CATEGORIES.get(exp.get('category', 'OTHER'), exp.get('category', 'Другое'))
-        
-        if exp.get('category') != "REPAYMENT":
-             msg += (
-                f"*{date}* ({category_label})\n"
-                f"👤 {payer_name} потратил: *{amount:,.0f} {curr}*\n"
-                f"📝 {desc}\n\n"
-            )
-        else:
-            repay_from_name = names.get(str(exp['payer_id']), 'Unknown')
-            repay_to_id = list(exp['split'].keys())[0]
-            repay_to_name = names.get(str(repay_to_id), 'Unknown')
-            msg += (
-                f"*{date}* ({category_label})\n"
-                f"💸 {repay_from_name} вернул {repay_to_name}: *{amount:,.0f} {curr}*\n\n"
-            )
-
-    keyboard = {"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]}
-
-    if message_id:
-        edit_message(chat_id, message_id, msg, reply_markup=keyboard)
-    else:
-        send_message(chat_id, msg, reply_markup=keyboard)
-
-def send_help_menu(chat_id):
-    msg = (
-        "📖 *Подробная Инструкция по Splitopus:*\n\n"
-        "Привет! Я Splitopus, твой незаменимый помощник для учета общих расходов в поездках и компаниях. Забудь о сложных таблицах — я сделаю все за тебя!\n\n"
-        "---\n\n"
-        "✨ **Начало работы:**\n\n"
-        "*   **🚀 Меню поездки:** Открывает главное меню вашей активной поездки, где вы найдете все основные инструменты.\n"
-        "*   **✨ Открыть новый финансовый кейс:** Создайте новую поездку/группу для учета расходов. Я попрошу вас ввести название и выбрать валюту.\n"
-        "*   **🤝 Подключиться к поездке:** Присоединитесь к существующей поездке, используя код, который вам дал ее создатель.\n"
-        "*   **🗂️ Мои поездки:** Просмотр списка всех поездок, в которых вы участвуете, и быстрое переключение между ними.\n\n"
-        "---\n\n"
-        "💸 **Учет Финансов:**\n\n"
-        "*   **Добавление трат:**\n"
-        "    Просто отправьте сообщение с суммой и описанием. Я сам предложу выбрать категорию и участников, которые делят этот расход.\n"
-        "    *   Пример: `500 Обед` (предложит выбрать категорию \"Еда\" и участников)\n"
-        "    *   Пример: `1200 Аренда байка` (предложит категорию \"Транспорт\")\n\n"
-        "*   **📊 Баланс (кнопка):**\n"
-        "    Покажет детальный финансовый отчет по вашей активной поездке:\n"
-        "    *   Общая сумма, потраченная на поездку.\n"
-        "    *   Сколько каждый участник внес в общий котел и его текущий баланс.\n"
-        "    *   Упрощенный расчет, кто кому сколько должен для окончательного выравнивания долгов.\n\n"
-        "*   **💸 Вернуть долг (кнопка):**\n"
-        "    Позволяет зафиксировать, что вы вернули деньги кому-то из участников поездки. Просто выберите участника и укажите сумму, которую вы ему отдали.\n\n"
-        "*   **👤 Моя статистика (кнопка):**\n"
-        "    Ваша личная финансовая статистика в активной поездке:\n"
-        "    *   Общая сумма, которую вы потратили, разделенная поровну.\n"
-        "    *   Разбивка ваших трат по категориям.\n"
-        "    *   История возвращенных вами долгов и полученных от других.\n\n"
-        "*   **🧾 Все траты / 📜 История трат (кнопки):**\n"
-        "    Позволяют просмотреть все или последние 10 расходов в текущей поездке.\n\n"
-        "---\n\n"
-        "📝 **Заметки:**\n\n"
-        "*   **📝 Заметки (кнопка):**\n"
-        "    Откроет список всех сохраненных текстовых заметок в текущей поездке, с указанием автора и даты.\n"
-        "    *   **➕ Добавить заметку (кнопка):** Нажмите эту кнопку, чтобы перейти в режим ввода заметки. Просто отправьте мне текст, и я сохраню его.\n\n"
-        "---\n\n"
-        "🎲 **Развлечения:**\n\n"
-        "*   **🎲 Рулетка (кнопка):**\n"
-        "    Не можете решить, кто платит? Запустите рулетку! Я случайным образом выберу одного из участников текущей поездки, который должен будет оплатить следующую трату.\n\n"
-        "---\n\n"
-        "⚙️ **Настройки и Отчеты:**\n\n"
-        "*   **`/setrate <курс>`:** Установить курс валюты вашей поездки к рублю для удобного отображения в отчетах.\n"
-        "    *   Пример: `/setrate 2.8` (если 1 местная валюта = 2.8 рубля)\n"
-        "*   **💾 Скачать отчет (кнопка):** Экспортирует все расходы текущей поездки в формате CSV-файла, который вы можете открыть в любой таблице для дальнейшего анализа.\n\n"
-        "---\n\n"
-        "💡 **Общие советы:**\n\n"
-        "*   Для команд бота используйте слеш (`/`), например, `/start` или `/balance`.\n"
-        "*   Суммы можно вводить как целые числа (например, `500`) или с десятичными дробями (например, `150.50`).\n"
-        "*   Большинство действий можно выполнить через удобные кнопки в меню.\n\n"
-        "Приятного пользования Splitopus!"
-    )
-    send_message(chat_id, msg)
-
-def notify_others(tid, payer_id, amount, desc, category, split_map):
-    users = load_json(USERS_FILE)
-    trips = load_json(TRIPS_FILE)
-    payer_name = users.get(str(payer_id), {}).get('name', 'User')
+    keyboard.append([{"text": f"💾 Сохранить (по {share:.0f})", "callback_data": f"CONFIRM|{draft_id}"}])
+    keyboard.append([{"text": "✏️ Ввести вручную", "callback_data": f"CUSTOM|{draft_id}"}])
+    keyboard.append([{"text": "❌ Отмена", "callback_data": f"CANCEL|{draft_id}"}])
     
-    trip = trips[tid]
-    curr = trip.get('currency', 'THB')
-    rate = trip.get('rate', 0)
+    text = f"💸 *{amount} {curr}* ({desc})\n🏷 {cat}\nКто участвует?"
+    markup = {"inline_keyboard": keyboard}
     
-    markup = {"inline_keyboard": [[{"text": "📊 Мой Баланс", "callback_data": "SHOW_MY_BALANCE"}]]}
-    
-    for uid in trips[tid]['members']:
-        if str(uid) != str(payer_id):
-            my_share = split_map.get(str(uid), 0)
-            if my_share > 0:
-                share_text = f"*{my_share:.0f} {curr}*"
-                if rate > 0: share_text += f" (~{my_share*rate:.0f} RUB)"
-                
-                title = "🧾 Новый Расход"
-                if category == "REPAYMENT": title = "💸 Возврат Долга"
-                
-                msg = (
-                    f"{title}\n"
-                    f"👤 *{payer_name}* -> *{amount:,.0f} {curr}*\n"
-                    f"📝 {desc}\n"
-                    f"📉 {share_text}"
-                )
-                send_message(uid, msg, reply_markup=markup)
+    if message_id: bot.edit_message(chat_id, message_id, text, reply_markup=markup)
+    else: bot.send_message(chat_id, text, reply_markup=markup)
+
+# --- Handlers ---
 
 def handle_command(chat_id, user_id, user_name, text):
-    users = load_json(USERS_FILE)
-    trips = load_json(TRIPS_FILE)
     uid_str = str(user_id)
+    users = data.load_json(data.USERS_FILE)
     
+    # Ensure user exists
     if uid_str not in users:
-        users[uid_str] = {"name": user_name, "active_trip_id": None, "joined_trips": [], "state": "IDLE", "partner_id": None}
-        save_json(USERS_FILE, users)
-    elif "joined_trips" not in users[uid_str]: 
-        old_tid = users[uid_str].get('trip_id')
-        users[uid_str]["active_trip_id"] = old_tid
-        users[uid_str]["joined_trips"] = [old_tid] if old_tid else []
-        if 'trip_id' in users[uid_str]: del users[uid_str]['trip_id']
-        save_json(USERS_FILE, users)
-
+        users[uid_str] = {"name": user_name, "active_trip_id": None, "joined_trips": [], "state": "IDLE"}
+        data.save_json(data.USERS_FILE, users)
+    
     cmd = text.split()[0]
     args = text.split()[1:]
 
-    # LEVEL 1: GLOBAL MENU
     if cmd == "/start":
         keyboard = {"inline_keyboard": [
             [{"text": "✨ Открыть новый финансовый кейс", "callback_data": "MENU_CREATE"}],
@@ -446,847 +176,290 @@ def handle_command(chat_id, user_id, user_name, text):
         
         tid = users[uid_str].get('active_trip_id')
         status = ""
-        if tid and tid in trips:
-            t_name = trips[tid].get('name', 'Trip')
-            keyboard["inline_keyboard"].insert(0, [{"text": f"🚀 Меню поездки ({t_name})", "callback_data": "OPEN_DASHBOARD"}])
-            status = f"Активная поездка: *{t_name}*\nБаланс под контролем. Пока что.\n"
+        if tid:
+            trip = data.get_trip(tid)
+            if trip:
+                t_name = trip.get('name', 'Trip')
+                keyboard["inline_keyboard"].insert(0, [{"text": f"🚀 Меню поездки ({t_name})", "callback_data": "OPEN_DASHBOARD"}])
+                status = f"Активная поездка: *{t_name}*\n"
             
-        msg = (
-            "🐙 *Splitopus Я считаю расходы, пока вы отдыхаете.*\n"
-            f"{status}"
-        )
-        send_message(chat_id, msg, reply_markup=keyboard)
-        
+        msg = f"🐙 *Splitopus*\n{status}"
+        bot.send_message(chat_id, msg, reply_markup=keyboard)
+
     elif cmd == "/menu":
         send_trip_dashboard(chat_id, user_id)
-
-    elif cmd == "/balance": 
-        handle_callback(chat_id, user_id, None, "MENU_BALANCE")
-    
-    elif cmd == "/me": 
-        handle_callback(chat_id, user_id, None, "MENU_ME")
-    
-    elif cmd == "/trips": 
-        handle_callback(chat_id, user_id, None, "MENU_TRIPS")
-    
-    elif cmd == "/help":
-        send_help_menu(chat_id)
-
-    elif cmd == "/note":
-        tid = users[uid_str].get('active_trip_id')
-        if not tid: return send_message(chat_id, "Нет активной поездки.")
-        note_text = " ".join(args)
-        if not note_text: return send_message(chat_id, "Пример: `/note Код 1234`")
-        if 'notes' not in trips[tid]: trips[tid]['notes'] = []
-        trips[tid]['notes'].append({"text": note_text, "author": user_name, "ts": time.time()})
-        save_json(TRIPS_FILE, trips)
-        send_message(chat_id, "✅ Заметка сохранена!", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-
-    elif cmd == "/notes":
-        tid = users[uid_str].get('active_trip_id')
-        if not tid: return send_message(chat_id, "Нет активной поездки.")
         
-        trip = trips[tid]
-        notes = trip.get('notes', [])
-        if not notes: 
-            msg = "📝 Заметок пока нет."
-            keyboard = {"inline_keyboard": [
-                [{"text": "➕ Добавить заметку", "callback_data": "ADD_NOTE_PROMPT"}],
-                [{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]
-            ]}
-            send_message(chat_id, msg, reply_markup=keyboard)
-            return
-        
-        msg = "📝 *Важные заметки:*\n\n"
-        for i, note in enumerate(notes):
-            date = datetime.fromtimestamp(note['ts']).strftime('%d.%m')
-            msg += f"{i+1}. {note['text']} _({note['author']}, {date})_\n"
-            
-        keyboard = {"inline_keyboard": [
-            [{"text": "➕ Добавить заметку", "callback_data": "ADD_NOTE_PROMPT"}],
-            [{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]
-        ]}
-        send_message(chat_id, msg, reply_markup=keyboard)
-
-    elif cmd == "/roulette":
-        tid = users[uid_str].get('active_trip_id')
-        if not tid: return send_message(chat_id, "Нет активной поездки.")
-        
-        members = trips[tid]['members']
-        if not members: return send_message(chat_id, "В поездке нет участников для рулетки.")
-        
-        victim_id = random.choice(members)
-        victim_name = users.get(str(victim_id), {}).get('name', 'Someone')
-        
-        # Сохраняем жертву и устанавливаем состояние ожидания
-        users[str(victim_id)]['state'] = "WAITING_ROULETTE_AMOUNT"
-        users[str(victim_id)]['roulette_trip_id'] = tid
-        users[str(victim_id)]['roulette_payer_id'] = str(victim_id)
-        save_json(USERS_FILE, users)
-
-        send_message(chat_id, "🎲 *Крутим рулетку...*")
-        time.sleep(1.5)
-        
-        # Уведомление всем, кто в чате рулетки
-        send_message(chat_id, f"🎯 Сегодня платит: *{victim_name.upper()}*! 🎉", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-        
-        # Отдельное уведомление жертве с запросом суммы
-        send_message(victim_id, f"🎉 Вы были выбраны рулеткой! Пожалуйста, введите сумму, которую вы оплатили:")
-
-    elif cmd == "/export":
-        tid = users[uid_str].get('active_trip_id')
-        if not tid: return
-        trip = trips[tid]
-        curr = trip.get('currency', 'THB')
-        csv_path = f"{DATA_DIR}/expenses.csv"
-        with open(csv_path, 'w') as f:
-            f.write(f"Date,Category,Payer,Amount ({curr}),Description\n")
-            names = {uid: users.get(uid, {}).get('name', 'Unknown') for uid in trip['members']}
-            for exp in trip['expenses']:
-                payer = names.get(str(exp['payer_id']), exp['payer_id'])
-                desc = exp.get('desc', '-')
-                cat = exp.get('category', 'Other')
-                f.write(f"{datetime.fromtimestamp(exp['ts'])},{cat},{payer},{exp['amount']},{desc}\n")
-        send_document(chat_id, csv_path)
-        send_message(chat_id, "✅ Отчет экспортирован.", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-
     elif cmd == "/setrate":
         tid = users[uid_str].get('active_trip_id')
-        if not tid: return send_message(chat_id, "Нет активной поездки.")
+        if not tid: return bot.send_message(chat_id, "Нет активной поездки.")
         try:
-            rate = float(args[0])
+            rate = float(args[0].replace(',', '.'))
+            trips = data.load_json(data.TRIPS_FILE)
             trips[tid]['rate'] = rate
-            save_json(TRIPS_FILE, trips)
+            data.save_json(data.TRIPS_FILE, trips)
             curr = trips[tid].get('currency', 'UNIT')
-            send_message(chat_id, f"✅ Курс установлен: 1 {curr} = {rate} RUB.", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
+            bot.send_message(chat_id, f"✅ Курс установлен: 1 {curr} = {rate} RUB.", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
         except:
-            send_message(chat_id, "❌ Пример: `/setrate 2.8`")
+            bot.send_message(chat_id, "❌ Пример: `/setrate 2.8`")
 
 def handle_text(chat_id, user_id, user_name, text):
-    users = load_json(USERS_FILE)
-    trips = load_json(TRIPS_FILE)
+    user = data.get_user(user_id)
+    state = user.get('state', 'IDLE')
     uid_str = str(user_id)
-    state = users.get(uid_str, {}).get('state', 'IDLE')
-    
-    # --- Roulette Amount State ---
-    if state == "WAITING_ROULETTE_AMOUNT":
-        try:
-            amount = float(text)
-            tid = users[uid_str].get('roulette_trip_id')
-            payer_id = users[uid_str].get('roulette_payer_id')
 
-            if not tid or not payer_id:
-                send_message(chat_id, "⚠️ Произошла ошибка с рулеткой. Попробуйте снова.")
-                users[uid_str]['state'] = "IDLE"
-                save_json(USERS_FILE, users)
-                return
-
-            trip = trips[tid]
-            members = trip['members']
-            split_map = {member_id: amount / len(members) for member_id in members}
-
-            new_exp = {
-                "id": int(time.time()),
-                "payer_id": payer_id,
-                "amount": amount,
-                "desc": "Расход по рулетке",
-                "category": "FUN", # Or create a new category "ROULETTE"
-                "split": split_map,
-                "ts": time.time()
-            }
-            trips[tid]['expenses'].append(new_exp)
-            save_json(TRIPS_FILE, trips)
-
-            # Clear roulette state
-            users[uid_str]['state'] = "IDLE"
-            if 'roulette_trip_id' in users[uid_str]: del users[uid_str]['roulette_trip_id']
-            if 'roulette_payer_id' in users[uid_str]: del users[uid_str]['roulette_payer_id']
-            save_json(USERS_FILE, users)
-
-            send_message(chat_id, f"✅ Расход по рулетке *{amount}* добавлен!", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-            notify_others(tid, payer_id, amount, "Расход по рулетке", "FUN", split_map)
-
-        except ValueError:
-            send_message(chat_id, "❌ Введите числовое значение суммы.")
-        return
-    
-    # --- Repayment Amount State ---
-    if state == "WAITING_REPAYMENT_AMOUNT":
-        try:
-            amount = float(text)
-            target_uid = users[uid_str].get('repay_target')
-            tid = users[uid_str].get('active_trip_id')
-            
-            new_exp = {
-                "id": int(time.time()),
-                "payer_id": uid_str,
-                "amount": amount,
-                "desc": "Возврат долга",
-                "category": "REPAYMENT",
-                "split": {target_uid: amount},
-                "ts": time.time()
-            }
-            trips[tid]['expenses'].append(new_exp)
-            save_json(TRIPS_FILE, trips)
-            
-            users[uid_str]['state'] = "IDLE"
-            save_json(USERS_FILE, users)
-            
-            target_name = users.get(target_uid, {}).get('name', 'User')
-            send_message(chat_id, f"✅ Вы вернули *{amount}* пользователю *{target_name}*.", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-            send_message(target_uid, f"💸 *{user_name}* вернул вам долг: *{amount}*")
-            
-        except ValueError: send_message(chat_id, "❌ Введите число.")
-        return
-
-    # --- Joining Trip State ---
-    if state == "WAITING_TRIP_CODE":
-        code = text.strip().upper()
-        found = None
-        for tid, t in trips.items():
-            if t['code'] == code: found = tid; break
-            
-        if found:
-            users[uid_str]['active_trip_id'] = found
-            if 'joined_trips' not in users[uid_str]: users[uid_str]['joined_trips'] = []
-            if found not in users[uid_str]['joined_trips']: users[uid_str]['joined_trips'].append(found)
-            
-            users[uid_str]['state'] = "IDLE"
-            if uid_str not in trips[found]['members']:
-                trips[found]['members'].append(uid_str)
-                for m in trips[found]['members']:
-                    if m != uid_str: send_message(m, f"👋 *{user_name}* присоединился!")
-            save_json(USERS_FILE, users)
-            save_json(TRIPS_FILE, trips)
-            
-            send_message(chat_id, f"✅ Вы присоединились! Активная поездка: `{trips[found].get('name')}`")
-            time.sleep(1)
-            send_trip_dashboard(chat_id, user_id) 
-        else:
-            send_message(chat_id, "❌ Неверный код.")
-        return
-
-    # --- Naming Trip State ---
+    # --- Trip Creation Flow ---
     if state == "WAITING_TRIP_NAME":
         name = text.strip()
-        code = generate_trip_code()
-        tid = f"trip_{int(time.time())}"
-        trips[tid] = {"code": code, "creator": uid_str, "members": [uid_str], "expenses": [], "name": name, "rate": 0, "currency": "THB", "notes": []}
+        tid, code = data.create_trip(user_id, name)
         
-        users[uid_str]['active_trip_id'] = tid
-        if 'joined_trips' not in users[uid_str]: users[uid_str]['joined_trips'] = []
-        users[uid_str]['joined_trips'].append(tid)
-        
-        users[uid_str]['state'] = "WAITING_TRIP_CURRENCY"
-        save_json(TRIPS_FILE, trips)
-        save_json(USERS_FILE, users)
+        data.update_user_state(user_id, "WAITING_TRIP_CURRENCY")
         
         keyboard = []
         row = []
-        for code, label in CURRENCIES.items():
+        for code, label in logic.CURRENCIES.items():
             row.append({"text": label, "callback_data": f"CURR|{code}"})
             if len(row) == 2: keyboard.append(row); row = []
         if row: keyboard.append(row)
         
-        send_message(chat_id, f"💱 Выберите валюту для поездки *{name}*:", reply_markup={"inline_keyboard": keyboard})
+        bot.send_message(chat_id, f"💱 Выберите валюту для поездки *{name}*:", reply_markup={"inline_keyboard": keyboard})
         return
 
-    # --- Trip Rate State ---
-    if state == "WAITING_TRIP_RATE":
-        try:
-            rate = float(text.replace(',', '.'))
-            tid = users[uid_str].get('active_trip_id')
-            if tid:
-                trips[tid]['rate'] = rate
-                save_json(TRIPS_FILE, trips)
-                code = trips[tid]['code']
-                curr = trips[tid]['currency']
-                send_message(chat_id, f"✅ Поездка создана!\nВалюта: *{curr}* (Курс: {rate})\n🔑 Код: `{code}`", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-                time.sleep(1)
-                send_trip_dashboard(chat_id, user_id)
+    # --- Joining Trip ---
+    if state == "WAITING_TRIP_CODE":
+        code = text.strip().upper()
+        trips = data.load_json(data.TRIPS_FILE)
+        users = data.load_json(data.USERS_FILE)
+        
+        found_tid = None
+        for tid, t in trips.items():
+            if t['code'] == code: found_tid = tid; break
+            
+        if found_tid:
+            users[uid_str]['active_trip_id'] = found_tid
+            if 'joined_trips' not in users[uid_str]: users[uid_str]['joined_trips'] = []
+            if found_tid not in users[uid_str]['joined_trips']: users[uid_str]['joined_trips'].append(found_tid)
             users[uid_str]['state'] = "IDLE"
-            save_json(USERS_FILE, users)
-        except ValueError:
-            send_message(chat_id, "❌ Введите число (например 2.8):")
+            
+            if uid_str not in trips[found_tid]['members']:
+                trips[found_tid]['members'].append(uid_str)
+                # Notify others
+                for m in trips[found_tid]['members']:
+                    if m != uid_str: bot.send_message(m, f"👋 *{user_name}* присоединился!")
+            
+            data.save_json(data.USERS_FILE, users)
+            data.save_json(data.TRIPS_FILE, trips)
+            
+            bot.send_message(chat_id, f"✅ Вы присоединились! Активная поездка: `{trips[found_tid].get('name')}`")
+            send_trip_dashboard(chat_id, user_id)
+        else:
+            bot.send_message(chat_id, "❌ Неверный код.")
         return
 
-    # --- Custom Currency State ---
-    if state == "WAITING_CUSTOM_CURRENCY":
-        curr = text.strip().upper()[:3]
-        tid = users[uid_str].get('active_trip_id')
-        if tid:
-            trips[tid]['currency'] = curr
-            save_json(TRIPS_FILE, trips)
-        users[uid_str]['state'] = "WAITING_TRIP_RATE"
-        save_json(USERS_FILE, users)
-        send_message(chat_id, f"💱 Какой курс 1 {curr_code} к рублю?", reply_markup={"inline_keyboard": [[{"text": "❌ Отмена", "callback_data": "OPEN_DASHBOARD"}]]})
-        return
-
-    # --- Custom Split State ---
-    if state == "WAITING_CUSTOM_SPLIT":
+    # --- Expense Entry (Default) ---
+    if state == "IDLE":
         try:
             parts = text.split()
-            amounts = [float(x) for x in parts]
-            drafts = load_json(DRAFTS_FILE)
-            draft_id = users[uid_str].get('draft_id')
-            draft = drafts.get(draft_id)
+            amount = float(parts[0])
+            desc = " ".join(parts[1:]) if len(parts) > 1 else "Расход"
             
-            if not draft: return send_message(chat_id, "⚠️ Время вышло.")
+            tid = data.get_active_trip_id(user_id)
+            if not tid: return bot.send_message(chat_id, "Сначала создайте или вступите в поездку! /start")
             
-            members = trips[draft['trip_id']]['members']
-            if len(amounts) != len(members): return send_message(chat_id, f"❌ Нужно {len(members)} сумм.")
-            if abs(sum(amounts) - draft['amount']) > 1.0: return send_message(chat_id, f"❌ Сумма не сходится.")
-                 
-            split_map = {m_id: amt for m_id, amt in zip(members, amounts)}
+            trip = data.get_trip(tid)
+            curr = trip.get('currency', 'THB')
             
-            new_exp = {
-                "id": int(time.time()),
-                "payer_id": draft['payer'],
-                "amount": draft['amount'],
-                "desc": draft['desc'],
-                "category": draft.get('category', 'OTHER'),
-                "split": split_map,
-                "ts": time.time()
+            draft_id = f"{user_id}_{int(time.time())}"
+            members = trip['members']
+            selected = {m: True for m in members}
+            
+            draft_data = {
+                "amount": amount,
+                "desc": desc,
+                "payer": uid_str,
+                "trip_id": tid,
+                "selected": selected,
+                "category": "OTHER"
             }
-            trips[draft['trip_id']]['expenses'].append(new_exp)
-            save_json(TRIPS_FILE, trips)
-            del drafts[draft_id]
-            save_json(DRAFTS_FILE, drafts)
-            users[uid_str]['state'] = "IDLE"
-            save_json(USERS_FILE, users)
+            data.save_draft(draft_id, draft_data)
+            send_category_menu(chat_id, draft_id, curr)
             
-            send_message(chat_id, f"✅ Сохранено: *{draft['amount']}* ({draft['desc']})", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-            notify_others(draft['trip_id'], draft['payer'], draft['amount'], draft['desc'], draft.get('category'), split_map)
-                    
-        except ValueError: send_message(chat_id, "❌ Введите числа.")
-        return
+        except ValueError:
+            pass # Not an expense (just text)
 
-    # --- Waiting for Note Input State ---
-    if state == "WAITING_FOR_NOTE_INPUT":
-        tid = users[uid_str].get('active_trip_id')
-        if not tid: 
-            send_message(chat_id, "Нет активной поездки для заметок.")
-            users[uid_str]['state'] = "IDLE"
-            save_json(USERS_FILE, users)
-            return
-        
-        note_text = text.strip()
-        if not note_text:
-            send_message(chat_id, "❌ Заметка не может быть пустой. Попробуйте снова.")
-            return
-
-        if 'notes' not in trips[tid]: trips[tid]['notes'] = []
-        trips[tid]['notes'].append({"text": note_text, "author": user_name, "ts": time.time()})
-        save_json(TRIPS_FILE, trips)
-        users[uid_str]['state'] = "IDLE"
-        save_json(USERS_FILE, users)
-        send_message(chat_id, "✅ Заметка сохранена!", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-        return
-
-    # --- Waiting Partner Code State ---
-    if state == "WAITING_PARTNER_CODE":
-        partner_code = text.strip()
-        found_partner_id = None
-        for p_uid, p_user_data in users.items():
-            if p_user_data.get('partner_invite_code') == partner_code and p_user_data.get('partner_id') is None: # Находим мальчика без пары
-                found_partner_id = p_uid
-                break
-        
-        if found_partner_id:
-            # Связываем партнеров
-            users[uid_str]['partner_id'] = found_partner_id
-            users[found_partner_id]['partner_id'] = uid_str
-            
-            # Очищаем код приглашения после использования
-            if 'partner_invite_code' in users[found_partner_id]:
-                del users[found_partner_id]['partner_invite_code']
-
-            # Если у мальчика есть активная поездка, добавляем девочку в нее
-            boys_active_trip_id = users[found_partner_id].get('active_trip_id')
-            if boys_active_trip_id and boys_active_trip_id in trips:
-                if uid_str not in trips[boys_active_trip_id]['members']:
-                    trips[boys_active_trip_id]['members'].append(uid_str)
-                    save_json(TRIPS_FILE, trips)
-                    send_message(found_partner_id, f"👫 *{user_name}* присоединилась к вашей поездке *{trips[boys_active_trip_id].get('name')}* как ваш партнер!")
-            
-            save_json(USERS_FILE, users)
-            send_message(chat_id, f"✅ Вы присоединились к *{users[found_partner_id].get('name', 'Партнеру')}* как партнер!")
-            users[uid_str]['state'] = "IDLE"
-            save_json(USERS_FILE, users)
-            time.sleep(1)
-            handle_command(chat_id, user_id, user_name, "/start")
-        else:
-            send_message(chat_id, "❌ Неверный код партнера или партнер уже имеет пару.")
-        return
-
-    # --- Expense Input ---
-    try:
-        parts = text.split()
-        amount = float(parts[0])
-        desc = " ".join(parts[1:]) if len(parts) > 1 else "Расход"
-        
-        tid = get_active_trip_id(uid_str)
-        if not tid: return send_message(chat_id, "Сначала создайте или вступите в поездку!")
-        
-        trip = trips[tid]
-        curr = trip.get('currency', 'THB')
-        
-        drafts = load_json(DRAFTS_FILE)
-        draft_id = f"{user_id}_{int(time.time())}"
-        
-        members = trips[tid]['members']
-        selected = {uid: True for uid in members} 
-        
-        drafts[draft_id] = {
-            "amount": amount,
-            "desc": desc,
-            "payer": str(user_id),
-            "trip_id": tid,
-            "selected": selected,
-            "category": "OTHER"
-        }
-        save_json(DRAFTS_FILE, drafts)
-        send_category_menu(chat_id, draft_id, curr)
-        
-    except ValueError: pass
-
-def send_category_menu(chat_id, draft_id, curr, message_id=None):
-    keyboard = []
-    row = []
-    for key, label in CATEGORIES.items():
-        if key == "REPAYMENT": continue
-        row.append({"text": label, "callback_data": f"CAT|{draft_id}|{label}"})
-        if len(row) == 2: keyboard.append(row); row = []
-    if row: keyboard.append(row)
-    
-    drafts = load_json(DRAFTS_FILE)
-    amount = drafts[draft_id]['amount']
-    desc = drafts[draft_id]['desc']
-    text = f"💸 *{amount} {curr}* ({desc})\n🏷 Выберите категорию:"
-    markup = {"inline_keyboard": keyboard}
-    if message_id: edit_message(chat_id, message_id, text, reply_markup=markup)
-    else: send_message(chat_id, text, reply_markup=markup)
-
-def send_split_menu(chat_id, draft_id, user_name, message_id=None):
-    drafts = load_json(DRAFTS_FILE)
-    draft = drafts.get(draft_id)
-    if not draft: return
-    trip = get_trip(draft['trip_id'])
-    curr = trip.get('currency', 'THB')
-    users = load_json(USERS_FILE)
-    amount = draft['amount']
-    desc = draft['desc']
-    cat = draft.get('category', '')
-    selected = draft['selected']
-    
-    keyboard = []
-    row = []
-    for uid, is_active in selected.items():
-        u_name = users.get(uid, {}).get('name', 'Unknown')
-        status = "✅" if is_active else "⬜️"
-        row.append({"text": f"{status} {u_name}", "callback_data": f"TOGGLE|{draft_id}|{uid}"})
-        if len(row) == 2: keyboard.append(row); row = []
-    if row: keyboard.append(row)
-    
-    count = sum(1 for v in selected.values() if v)
-    share = amount / count if count > 0 else 0
-    keyboard.append([{"text": f"💾 Сохранить (по {share:.0f})", "callback_data": f"CONFIRM|{draft_id}"}])
-    keyboard.append([{"text": "✏️ Ввести вручную", "callback_data": f"CUSTOM|{draft_id}"}])
-    keyboard.append([{"text": "❌ Отмена", "callback_data": f"CANCEL|{draft_id}"}])
-    
-    text = f"💸 *{amount} {curr}* ({desc})\n🏷 {cat}\nКто участвует?"
-    markup = {"inline_keyboard": keyboard}
-    if message_id: edit_message(chat_id, message_id, text, reply_markup=markup)
-    else: send_message(chat_id, text, reply_markup=markup)
-
-def handle_callback(chat_id, user_id, message_id, data):
-    parts = data.split("|")
+def handle_callback(chat_id, user_id, message_id, data_str):
+    parts = data_str.split("|")
     cmd = parts[0]
     uid_str = str(user_id)
     
-    # --- Navigation ---
     if cmd == "OPEN_DASHBOARD":
         send_trip_dashboard(chat_id, user_id, message_id)
         return
 
     if cmd == "MENU_CREATE":
-        users = load_json(USERS_FILE)
-        users[uid_str]['state'] = "WAITING_TRIP_NAME"
-        save_json(USERS_FILE, users)
-        send_message(chat_id, "✏️ Введите название поездки (например: `Тай 2026`):")
+        data.update_user_state(user_id, "WAITING_TRIP_NAME")
+        bot.send_message(chat_id, "✏️ Введите название поездки (например: `Тай 2026`):")
         return
 
     if cmd == "MENU_JOIN":
-        users = load_json(USERS_FILE)
-        users[uid_str]['state'] = "WAITING_TRIP_CODE"
-        save_json(USERS_FILE, users)
-        send_message(chat_id, "⌨️ Введите код:")
-        return
-
-    if cmd == "MENU_TRIPS":
-        users = load_json(USERS_FILE)
-        trips = load_json(TRIPS_FILE)
-        joined = users[uid_str].get('joined_trips', [])
-        keyboard = []
-        active = users[uid_str].get('active_trip_id')
-        
-        for tid in joined:
-            t = trips.get(tid)
-            if not t: continue
-            mark = "✅ " if tid == active else ""
-            keyboard.append([{"text": f"{mark}{t.get('name')}", "callback_data": f"SWITCH_TRIP|{tid}"}])
-        
-        keyboard.append([{"text": "🔙 В главное меню", "callback_data": "BACK_MAIN"}]
-        )
-        edit_message(chat_id, message_id, "🗂 *Ваши поездки*:", reply_markup={"inline_keyboard": keyboard})
-        return
-
-    if cmd == "BACK_MAIN":
-        handle_command(chat_id, user_id, "User", "/start")
-        return
-
-    if cmd == "SWITCH_TRIP":
-        target_tid = parts[1]
-        users = load_json(USERS_FILE)
-        trips = load_json(TRIPS_FILE)
-        if target_tid in users[uid_str].get('joined_trips', []):
-            users[uid_str]['active_trip_id'] = target_tid
-            save_json(USERS_FILE, users)
-            send_trip_dashboard(chat_id, user_id, message_id)
-        return
-
-    # --- Dashboard Actions ---
-    if cmd == "MENU_BALANCE": 
-        users = load_json(USERS_FILE)
-        tid = users[uid_str].get('active_trip_id')
-        if not tid: return
-        trips = load_json(TRIPS_FILE)
-        trip = trips[tid]
-        curr = trip.get('currency', 'THB')
-        rate = trip.get('rate', 0)
-        
-        balances, total_trip_expenses, total_paid_by_member = calculate_balance(tid)
-        names = {uid: users.get(uid, {}).get('name', 'Unknown') for uid in trip['members']}
-        
-        report = f"📊 *Баланс ({trip.get('name')}):*\n"
-        
-        # 1) Overall trip expenses
-        total_trip_expenses_str = f"{total_trip_expenses:,.0f} {curr}"
-        if rate > 0: total_trip_expenses_str += f" (~{total_trip_expenses*rate:,.0f} RUB)"
-        report += f"💰 *Всего потрачено на поездку: {total_trip_expenses_str}*\n\n"
-        
-        # 2) Each member's paid amount and balance difference
-        report += "👤 *Статистика участников:*\n"
-        for uid in trip['members']:
-            name = names.get(uid, uid)
-            paid = total_paid_by_member.get(uid, 0.0)
-            balance_amt = balances.get(uid, 0.0)
-            emoji = "🟢" if balance_amt >= 0 else "🔴"
-            
-            paid_str = f"{paid:,.0f} {curr}"
-            balance_str = f"{balance_amt:+.0f} {curr}"
-            if rate > 0:
-                paid_str += f" (~{paid*rate:,.0f} RUB)"
-                balance_str += f" (~{balance_amt*rate:+.0f} RUB)"
-            
-            report += f"- {name}: Потрачено: *{paid_str}* | Баланс: {emoji} *{balance_str}*\n"
-        
-        # 3) Simplified debts
-        simplified_transactions = simplify_debts(balances, names)
-        if simplified_transactions:
-            report += "\n🤝 *Кто кому должен (для выравнивания):*\n"
-            for t in simplified_transactions:
-                report += f"- {t['from']} должен {t['to']}: *{t['amount']:,.0f} {curr}*\n"
-        else:
-            report += "\n✅ *Балансы выровнены!*\n"
-
-        keyboard = {"inline_keyboard": [
-            [{"text": "⚙️ Сделать расчет", "callback_data": "MENU_SETTLE"}],
-            [{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]
-        ]}
-        
-        send_message(chat_id, report, reply_markup=keyboard)
-        return
-
-    elif cmd == "MENU_SETTLE":
-        users = load_json(USERS_FILE)
-        tid = users[uid_str].get('active_trip_id')
-        if not tid: return
-        trips = load_json(TRIPS_FILE)
-        trip = trips[tid]
-        curr = trip.get('currency', 'THB')
-        rate = trip.get('rate', 0)
-        balances, _, _ = calculate_balance(tid) # Get only balances
-        names = {uid: users.get(uid, {}).get('name', 'Unknown') for uid in trip['members']}
-        
-        simplified_transactions = simplify_debts(balances, names)
-        
-        if not simplified_transactions:
-            send_message(chat_id, "✅ Балансы уже выровнены, расчетов не требуется!", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-            return
-
-        # Send personalized notifications
-        for transaction in simplified_transactions:
-            from_name = transaction['from']
-            to_name = transaction['to']
-            amount = transaction['amount']
-            
-            amount_str = f"*{amount:,.0f} {curr}*"
-            if rate > 0: amount_str += f" (~{amount*rate:,.0f} RUB)"
-
-            # Find sender and recipient IDs by name
-            from_id = next((uid for uid, name in names.items() if name == from_name), None)
-            to_id = next((uid for uid, name in names.items() if name == to_name), None)
-
-            if from_id:
-                send_message(from_id, f"💸 Вам необходимо перевести *{amount_str}* пользователю *{to_name}*.")
-            if to_id:
-                send_message(to_id, f"💰 Пользователь *{from_name}* должен вам *{amount_str}*.")
-        
-        send_message(chat_id, "✅ Расчеты инициированы! Всем участникам отправлены личные сообщения с инструкциями.", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-        return
-
-    if cmd == "MENU_ALL_EXPENSES":
-        send_all_expenses_list(chat_id, user_id, message_id)
-        return
-
-    if cmd == "ALL_EXPENSES_PAGE":
-        page = int(parts[1])
-        send_all_expenses_list(chat_id, user_id, message_id, page)
-        return
-
-    if cmd == "MENU_RECENT_EXPENSES":
-        send_recent_expenses(chat_id, user_id, message_id)
-        return
-
-    if cmd == "MENU_ME":
-        users = load_json(USERS_FILE)
-        tid = users[uid_str].get('active_trip_id')
-        if not tid: return
-        trips = load_json(TRIPS_FILE)
-        stats = get_my_stats(tid, uid_str)
-        curr = trips[tid].get('currency', 'THB')
-        names = {uid: users.get(uid, {}).get('name', 'Unknown') for uid in trips[tid]['members']} # Get names
-        
-        report = f"👤 *Ваша статистика ({trips[tid].get('name')}):*\n\n"
-        
-        report += f"💰 *Всего потрачено вами поровну: {stats['total_share']:.0f} {curr}*\n"
-        if stats['cats']:
-            report += "*Траты по категориям:*\n"
-            for cat, amt in stats['cats'].items():
-                report += f"  - {CATEGORIES.get(cat, cat)}: {amt:.0f} {curr}\n"
-        
-        if stats['my_repayments']:
-            report += "\n💸 *Вы вернули долги:*\n"
-            for rep in stats['my_repayments']:
-                date = datetime.fromtimestamp(rep['ts']).strftime('%d.%m %H:%M')
-                target_name = names.get(str(rep['to']), 'Unknown')
-                report += f"  - {date}: *{rep['amount']:.0f} {curr}* -> {target_name}\n"
-
-        if stats['received_repayments']:
-            report += "\n💰 *Вам вернули долги:*\n"
-            for rep in stats['received_repayments']:
-                date = datetime.fromtimestamp(rep['ts']).strftime('%d.%m %H:%M')
-                from_name = names.get(str(rep['from']), 'Unknown')
-                report += f"  - {date}: *{rep['amount']:.0f} {curr}* от {from_name}\n"
-            
-        send_message(chat_id, report, reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-        return
-
-    if cmd == "MENU_REPAY":
-        users = load_json(USERS_FILE)
-        trips = load_json(TRIPS_FILE)
-        tid = users[uid_str].get('active_trip_id')
-        if not tid: return
-        keyboard = []
-        for m in trips[tid]['members']:
-            if str(m) != uid_str:
-                name = users.get(str(m), {}).get('name', 'User')
-                keyboard.append([{"text": name, "callback_data": f"REPAY_TO|{m}"}])
-        send_message(chat_id, "💸 Кому?", reply_markup={"inline_keyboard": keyboard})
-        return
-
-    if cmd == "MENU_ROULETTE":
-        handle_command(chat_id, user_id, "U", "/roulette")
-        return
-
-    if cmd == "MENU_NOTES":
-        handle_command(chat_id, user_id, "U", "/notes")
-        return
-
-    if cmd == "MENU_EXPORT":
-        handle_command(chat_id, user_id, "U", "/export")
-        return
-
-    # --- Logic Handlers ---
-    if cmd == "REPAY_TO":
-        target_uid = parts[1]
-        users = load_json(USERS_FILE)
-        users[uid_str]['state'] = "WAITING_REPAYMENT_AMOUNT"
-        users[uid_str]['repay_target'] = target_uid
-        save_json(USERS_FILE, users)
-        send_message(chat_id, "💸 Введите сумму:")
+        data.update_user_state(user_id, "WAITING_TRIP_CODE")
+        bot.send_message(chat_id, "⌨️ Введите код:")
         return
 
     if cmd == "CURR":
         curr_code = parts[1]
-        users = load_json(USERS_FILE)
-        trips = load_json(TRIPS_FILE)
-        tid = users[uid_str].get('active_trip_id')
-        if curr_code == "CUSTOM":
-            users[uid_str]['state'] = "WAITING_CUSTOM_CURRENCY"
-            save_json(USERS_FILE, users)
-            send_message(chat_id, "⌨️ Введите код:")
-        else:
-            if tid: trips[tid]['currency'] = curr_code; save_json(TRIPS_FILE, trips)
-            users[uid_str]['state'] = "WAITING_TRIP_RATE"
-            save_json(USERS_FILE, users)
-            curr = curr_code # <-- This line is added
-            send_message(chat_id, f"💱 Какой курс 1 {curr_code} к рублю?", reply_markup={"inline_keyboard": [[{"text": "❌ Отмена", "callback_data": "OPEN_DASHBOARD"}]]})
-        return
-
-    if cmd == "SHOW_MY_BALANCE":
-        users = load_json(USERS_FILE)
-        tid = users.get(uid_str, {}).get('active_trip_id')
+        tid = data.get_active_trip_id(user_id)
         if tid:
-            trips = load_json(TRIPS_FILE)
-            trip = trips.get(tid)
-            if trip:
-                curr = trip.get('currency', 'THB')
-                rate = trip.get('rate', 0)
-                balances, _, _ = calculate_balance(tid) # Corrected to get 3 returns
-                my_bal = balances.get(uid_str, 0)
-                emoji = "🟢" if my_bal >= 0 else "🔴"
-                amt = f"{my_bal:+.0f} {curr}"
-                if rate > 0: amt += f" (~{my_bal*rate:+.0f} RUB)"
-                send_message(chat_id, f"📊 Ваш баланс: {emoji} *{amt}*", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-        return
-
-    if cmd == "ADD_NOTE_PROMPT":
-        users = load_json(USERS_FILE)
-        users[uid_str]['state'] = "WAITING_FOR_NOTE_INPUT"
-        save_json(USERS_FILE, users)
-        send_message(chat_id, "✍️ Введите текст заметки:")
-        return
-
-    if cmd == "MENU_JOIN_PARTNER":
-        users = load_json(USERS_FILE)
-        users[uid_str]['state'] = "WAITING_PARTNER_CODE"
-        save_json(USERS_FILE, users)
-        send_message(chat_id, "⌨️ Введите код партнера:")
-        return
-
-    if cmd == "MENU_INVITE_PARTNER":
-        users = load_json(USERS_FILE)
-        trips = load_json(TRIPS_FILE)
-        
-        # Проверка, есть ли уже партнер
-        if users[uid_str].get('partner_id') is not None:
-            partner_name = users.get(str(users[uid_str]['partner_id']), {}).get('name', 'Партнер')
-            send_message(chat_id, f"👫 У вас уже есть партнер: *{partner_name}*.", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-            return
+            trips = data.load_json(data.TRIPS_FILE)
+            trips[tid]['currency'] = curr_code
+            data.save_json(data.TRIPS_FILE, trips)
             
-        # Генерируем новый код приглашения
-        invite_code = generate_trip_code() # Используем ту же функцию, что и для трипов
-        users[uid_str]['partner_invite_code'] = invite_code
-        save_json(USERS_FILE, users)
-        
-        send_message(chat_id, f"🔑 Ваш код для приглашения партнера: `{invite_code}`\nОтправьте его вашей девушке, чтобы она могла присоединиться.", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
+            trip = trips[tid]
+            bot.send_message(chat_id, f"✅ Поездка создана!\nВалюта: *{curr_code}*\n🔑 Код: `{trip['code']}`", 
+                             reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
+            data.update_user_state(user_id, "IDLE")
+            send_trip_dashboard(chat_id, user_id)
         return
 
-    if cmd == "SHOW_HELP": send_help_menu(chat_id); return
-
-    if cmd == "CAT": 
+    if cmd == "CAT":
         draft_id = parts[1]
-        cat_label = parts[2]
-        drafts = load_json(DRAFTS_FILE)
-        if draft_id in drafts:
-            drafts[draft_id]['category'] = cat_label
-            save_json(DRAFTS_FILE, drafts)
-            users = load_json(USERS_FILE)
-            user_name = users.get(uid_str, {}).get('name', 'User')
-            send_split_menu(chat_id, draft_id, user_name, message_id)
+        category_label = parts[2]
+        
+        # Map label back to key if needed, or store label directly
+        # For simplicity, finding key from label
+        cat_key = "OTHER"
+        for k, v in logic.CATEGORIES.items():
+            if v == category_label:
+                cat_key = k
+                break
+        
+        draft = data.get_draft(draft_id)
+        if draft:
+            draft['category'] = cat_key
+            data.save_draft(draft_id, draft)
+            send_split_menu(chat_id, draft_id, message_id)
         return
 
     if cmd == "TOGGLE":
+        draft_id = parts[1]
         target_uid = parts[2]
+        draft = data.get_draft(draft_id)
+        if draft:
+            draft['selected'][target_uid] = not draft['selected'].get(target_uid, False)
+            data.save_draft(draft_id, draft)
+            send_split_menu(chat_id, draft_id, message_id)
+        return
+
+    if cmd == "CONFIRM":
         draft_id = parts[1]
-        drafts = load_json(DRAFTS_FILE)
-        if draft_id in drafts:
-            curr = drafts[draft_id]['selected'].get(target_uid, False)
-            drafts[draft_id]['selected'][target_uid] = not curr
-            save_json(DRAFTS_FILE, drafts)
-            users = load_json(USERS_FILE)
-            user_name = users.get(uid_str, {}).get('name', 'User')
-            send_split_menu(chat_id, draft_id, user_name, message_id)
-            
-    elif cmd == "CONFIRM":
-        draft_id = parts[1]
-        drafts = load_json(DRAFTS_FILE)
-        draft = drafts.get(draft_id)
+        draft = data.get_draft(draft_id)
         if not draft: return
-        selected = draft['selected']
-        active_uids = [uid for uid, v in selected.items() if v]
-        if not active_uids: return 
-        amount = draft['amount']
-        share = amount / len(active_uids)
-        split_map = {uid: share for uid in active_uids}
-        trips = load_json(TRIPS_FILE)
+        
         tid = draft['trip_id']
+        selected = draft['selected']
+        count = sum(1 for v in selected.values() if v)
+        if count == 0: return bot.answer_callback_query(message_id, "Выберите хотя бы одного участника!")
+        
+        amount = draft['amount']
+        share = amount / count
+        
+        split_map = {uid: share for uid, active in selected.items() if active}
+        
         new_exp = {
             "id": int(time.time()),
             "payer_id": draft['payer'],
             "amount": amount,
             "desc": draft['desc'],
-            "category": draft.get('category', 'Other'),
+            "category": draft['category'],
             "split": split_map,
             "ts": time.time()
         }
+        
+        trips = data.load_json(data.TRIPS_FILE)
         trips[tid]['expenses'].append(new_exp)
-        save_json(TRIPS_FILE, trips)
-        del drafts[draft_id]
-        save_json(DRAFTS_FILE, drafts)
-        edit_message(chat_id, message_id, f"✅ Сохранено: *{amount}* ({draft.get('category')})\nРазделено на {len(active_uids)} чел.", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
-        notify_others(tid, draft['payer'], amount, draft['desc'], draft.get('category'), split_map)
+        data.save_json(data.TRIPS_FILE, trips)
+        data.delete_draft(draft_id)
+        
+        bot.edit_message(chat_id, message_id, f"✅ Сохранено: *{amount}* ({draft['desc']})", 
+                         reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
+        
+        notify_others(tid, draft['payer'], amount, draft['desc'], draft['category'], split_map)
+        return
 
-    elif cmd == "CUSTOM":
+    if cmd == "CANCEL":
         draft_id = parts[1]
-        users = load_json(USERS_FILE)
-        users[uid_str]['state'] = "WAITING_CUSTOM_SPLIT"
-        users[uid_str]['draft_id'] = draft_id
-        save_json(USERS_FILE, users)
-        trips = load_json(TRIPS_FILE)
-        drafts = load_json(DRAFTS_FILE)
-        tid = drafts[draft_id]['trip_id']
-        members = trips[tid]['members']
-        names = [users.get(m, {}).get('name', 'User') for m in members]
-        edit_message(chat_id, message_id, f"✏️ Введите суммы для:\n*{', '.join(names)}*\n\nЧерез пробел.")
+        data.delete_draft(draft_id)
+        bot.edit_message(chat_id, message_id, "❌ Отменено.", 
+                         reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
+        return
 
-    elif cmd == "CANCEL":
-        draft_id = parts[1]
-        drafts = load_json(DRAFTS_FILE)
-        if draft_id in drafts: del drafts[draft_id]; save_json(DRAFTS_FILE, drafts)
-        edit_message(chat_id, message_id, "❌ Отменено.", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
+    if cmd == "MENU_BALANCE":
+        tid = data.get_active_trip_id(user_id)
+        if not tid: return
+        trip = data.get_trip(tid)
+        
+        balances, total_spent, total_paid = logic.calculate_balance(trip)
+        users_db = data.load_json(data.USERS_FILE)
+        names = {uid: users_db.get(uid, {}).get('name', 'Unknown') for uid in trip['members']}
+        
+        curr = trip.get('currency', 'THB')
+        report = f"📊 *Баланс ({trip.get('name')}):*\n"
+        report += f"💰 Всего: *{total_spent:,.0f} {curr}*\n\n"
+        
+        for uid, bal in balances.items():
+            name = names.get(uid, uid)
+            emoji = "🟢" if bal >= 0 else "🔴"
+            report += f"{name}: {emoji} *{bal:+.0f} {curr}*\n"
+            
+        txs = logic.simplify_debts(balances, names)
+        if txs:
+            report += "\n🤝 *Расчеты:*\n"
+            for t in txs:
+                report += f"{t['from']} -> {t['to']}: *{t['amount']:,.0f} {curr}*\n"
+        else:
+            report += "\n✅ Все чисто!"
+            
+        bot.send_message(chat_id, report)
+        return
 
-def main():
-    print("ThaiSplitBot v3.2.1 (Fix) Started...")
+# --- Main Loop ---
+def run():
+    logger.info("Bot started...")
     offset = None
     while True:
-        updates = get_updates(offset)
-        for u in updates:
-            offset = u["update_id"] + 1
-            if "message" in u:
-                msg = u["message"]
-                chat_id = msg["chat"]["id"]
-                user_id = msg["from"]["id"]
-                name = msg["from"].get("first_name", "User")
-                text = msg.get("text", "")
-                if text.startswith("/"): handle_command(chat_id, user_id, name, text)
-                else: handle_text(chat_id, user_id, name, text)
-            elif "callback_query" in u:
-                cb = u["callback_query"]
-                handle_callback(cb["message"]["chat"]["id"], cb["from"]["id"], cb["message"]["message_id"], cb["data"])
-        time.sleep(1)
+        try:
+            updates = bot.get_updates(offset=offset, timeout=30)
+            for u in updates:
+                offset = u['update_id'] + 1
+                
+                if 'message' in u:
+                    msg = u['message']
+                    chat_id = msg['chat']['id']
+                    user = msg.get('from', {})
+                    user_id = user.get('id')
+                    user_name = user.get('first_name', 'User')
+                    text = msg.get('text', '')
+                    
+                    if text.startswith('/'):
+                        handle_command(chat_id, user_id, user_name, text)
+                    else:
+                        handle_text(chat_id, user_id, user_name, text)
+                        
+                elif 'callback_query' in u:
+                    cb = u['callback_query']
+                    chat_id = cb['message']['chat']['id']
+                    user_id = cb['from']['id']
+                    msg_id = cb['message']['message_id']
+                    data_str = cb['data']
+                    
+                    handle_callback(chat_id, user_id, msg_id, data_str)
+                    bot.answer_callback_query(cb['id'])
+                    
+        except KeyboardInterrupt:
+            logger.info("Stopping bot...")
+            break
+        except Exception as e:
+            logger.error(f"Main loop error: {e}", exc_info=True)
+            time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    run()
