@@ -1,11 +1,9 @@
-# Data
-data/*.json
-*.log
 __pycache__/
+*.pyc
 .env
-bot_token
-.DS_Store
-.idea/
-.vscode/
-venv/
+bot.log
+*.log
+data/
+!data/.gitkeep
 .venv/
+.DS_Store

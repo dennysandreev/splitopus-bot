@@ -1,160 +1,114 @@
 import json
 import os
-import random
-import string
 import time
+from . import db
 
-# --- Configuration & Constants ---
+# --- Initialization ---
+db.init_db()
+
+# --- Constants ---
 DATA_DIR = "data"
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 TRIPS_FILE = os.path.join(DATA_DIR, "trips.json")
 DRAFTS_FILE = os.path.join(DATA_DIR, "drafts.json")
 
-# Ensure data directory exists
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+# --- User Operations ---
 
-# --- Base JSON Operations ---
+def get_user(user_id):
+    u = db.get_user(user_id)
+    if u:
+        temp = db.get_user_temp_data(user_id)
+        u.update(temp)
+    return u
+
+def update_user_state(user_id, state, **kwargs):
+    name = kwargs.get('user_name', 'Unknown')
+    existing = db.get_user(user_id)
+    if not existing:
+        db.upsert_user(user_id, name)
+    
+    db.update_user_state(user_id, state)
+    
+    temp_kwargs = {k: v for k, v in kwargs.items() if k != 'user_name'}
+    if temp_kwargs:
+        db.update_user_temp_data(user_id, temp_kwargs)
+
+def get_active_trip_id(user_id):
+    u = db.get_user(user_id)
+    return u['active_trip_id'] if u else None
+
+def set_user_active_trip(user_id, trip_id):
+    db.set_user_active_trip(user_id, trip_id)
+
+def link_users(child_id, parent_id):
+    db.link_users(child_id, parent_id)
+    return True
+
+def get_user_menu_id(user_id):
+    u = db.get_user(user_id)
+    return u['menu_msg_id'] if u else None
+
+def set_user_menu_id(user_id, msg_id):
+    db.set_user_menu_id(user_id, msg_id)
+    
+def get_linked_names(master_id):
+    return db.get_linked_names(master_id)
+
+def get_all_users_as_dict():
+    return db.get_all_users_as_dict()
+
+# --- Trip Operations ---
+
+def create_trip(creator_id, name):
+    tid = f"trip_{int(time.time())}"
+    code = db.generate_trip_code()
+    db.create_trip(tid, code, creator_id, name)
+    db.set_user_active_trip(creator_id, tid)
+    return tid, code
+
+def get_trip(trip_id):
+    return db.get_trip(trip_id)
+
+def get_trip_by_code(code):
+    return db.get_trip_by_code(code)
+
+def add_member_to_trip(trip_id, user_id):
+    db.add_member_to_trip(trip_id, user_id)
+
+def get_user_trips(user_id):
+    return db.get_user_trips(user_id)
+
+def update_trip_rate(trip_id, rate):
+    db.update_trip_rate(trip_id, rate)
+    
+def update_trip_currency(trip_id, currency):
+    db.update_trip_currency(trip_id, currency)
+
+# --- Expense & Note Operations ---
+
+def add_expense(trip_id, payer_id, amount, desc, category, split_map):
+    db.add_expense(trip_id, payer_id, amount, desc, category, split_map)
+
+def add_note(trip_id, author_name, text):
+    db.add_note(trip_id, author_name, text)
+
+# --- Draft Operations ---
+
+def save_draft(draft_id, data):
+    db.save_draft(draft_id, data)
+
+def get_draft(draft_id):
+    return db.get_draft(draft_id)
+
+def delete_draft(draft_id):
+    db.delete_draft(draft_id)
+
+# --- Legacy Compat ---
+
 def load_json(path):
-    if os.path.exists(path):
-        with open(path, 'r', encoding='utf-8') as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return {}
+    if path == USERS_FILE:
+        return db.get_all_users_as_dict()
     return {}
 
 def save_json(path, data):
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-# --- User Operations ---
-def get_user(user_id):
-    users = load_json(USERS_FILE)
-    return users.get(str(user_id))
-
-def get_active_trip_id(user_id):
-    user = get_user(user_id)
-    return user.get('active_trip_id') if user else None
-
-def update_user_state(user_id, state, **kwargs):
-    users = load_json(USERS_FILE)
-    uid_str = str(user_id)
-    if uid_str not in users:
-        users[uid_str] = {"state": state}
-    else:
-        users[uid_str]['state'] = state
-    
-    # Merge additional fields into user data
-    for k, v in kwargs.items():
-        users[uid_str][k] = v
-        
-    save_json(USERS_FILE, users)
-
-# --- Trip Operations ---
-def generate_trip_code():
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-
-def get_trip(trip_id):
-    trips = load_json(TRIPS_FILE)
-    return trips.get(trip_id)
-
-def create_trip(creator_id, name):
-    trips = load_json(TRIPS_FILE)
-    users = load_json(USERS_FILE)
-    
-    code = generate_trip_code()
-    tid = f"trip_{int(time.time())}"
-    uid_str = str(creator_id)
-    
-    trips[tid] = {
-        "code": code,
-        "creator": uid_str,
-        "members": [uid_str],
-        "expenses": [],
-        "name": name,
-        "rate": 0,
-        "currency": "THB",
-        "notes": []
-    }
-    
-    # Update user active trip
-    if uid_str not in users: users[uid_str] = {}
-    users[uid_str]['active_trip_id'] = tid
-    if 'joined_trips' not in users[uid_str]: users[uid_str]['joined_trips'] = []
-    if tid not in users[uid_str]['joined_trips']: users[uid_str]['joined_trips'].append(tid)
-    
-    save_json(TRIPS_FILE, trips)
-    save_json(USERS_FILE, users)
-    return tid, code
-
-# --- Draft Operations ---
-def save_draft(draft_id, data):
-    drafts = load_json(DRAFTS_FILE)
-    drafts[draft_id] = data
-    save_json(DRAFTS_FILE, drafts)
-
-def get_draft(draft_id):
-    drafts = load_json(DRAFTS_FILE)
-    return drafts.get(draft_id)
-
-def delete_draft(draft_id):
-    drafts = load_json(DRAFTS_FILE)
-    if draft_id in drafts:
-        del drafts[draft_id]
-        save_json(DRAFTS_FILE, drafts)
-
-# --- Linkage / Family Operations ---
-def link_users(child_id, parent_id):
-    """
-    Links child_id to parent_id.
-    child_id will effectively use parent_id's balance.
-    """
-    users = load_json(USERS_FILE)
-    cid, pid = str(child_id), str(parent_id)
-    
-    if cid in users and pid in users:
-        users[cid]['linked_to'] = pid
-        save_json(USERS_FILE, users)
-        return True
-    return False
-
-def get_master_id(user_id):
-    """
-    Returns the ID of the wallet owner.
-    If user is linked, returns their parent's ID.
-    If user is independent, returns their own ID.
-    """
-    users = load_json(USERS_FILE)
-    uid = str(user_id)
-    user = users.get(uid)
-    
-    if user and user.get('linked_to'):
-        return user['linked_to']
-    return uid
-
-def get_user_menu_id(user_id):
-    user = get_user(user_id)
-    return user.get('menu_msg_id') if user else None
-
-def set_user_menu_id(user_id, msg_id):
-    users = load_json(USERS_FILE)
-    uid = str(user_id)
-    if uid in users:
-        users[uid]['menu_msg_id'] = msg_id
-        save_json(USERS_FILE, users)
-
-def get_linked_names(master_id):
-    """Returns a string like 'Denis + Anya' or just 'Denis'"""
-    users = load_json(USERS_FILE)
-    mid = str(master_id)
-    
-    names = [users.get(mid, {}).get('name', 'Unknown')]
-    
-    # Find children
-    for uid, u in users.items():
-        if u.get('linked_to') == mid:
-            names.append(u.get('name', 'Partner'))
-            
-    return " + ".join(names)
-
+    pass 
