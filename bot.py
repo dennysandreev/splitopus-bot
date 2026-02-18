@@ -160,15 +160,9 @@ def send_category_menu(chat_id, draft_id, curr, message_id=None):
     text = f"💸 *{amount} {curr}* ({desc})\n🏷 Выберите категорию:"
     markup = {"inline_keyboard": keyboard}
     
-    # Category menu always replaces/refreshes main menu or is a fresh message
-    # If triggered by text input, message_id is None -> send fresh
     if message_id: 
         bot.edit_message(chat_id, message_id, text, reply_markup=markup)
     else:
-        # We treat this as a temporary menu overlay. 
-        # Ideally, we should also track this ID to delete it if cancelled.
-        # For now, let's just send it.
-        # Alternatively: Replace the Main Menu with this!
         refresh_menu_msg(chat_id, draft['payer'], text, reply_markup=markup)
 
 def send_split_menu(chat_id, draft_id, message_id=None):
@@ -181,7 +175,7 @@ def send_split_menu(chat_id, draft_id, message_id=None):
     amount = draft['amount']
     desc = draft['desc']
     cat = draft.get('category', '')
-    selected = draft['selected']
+    selected = draft['selected'] 
     
     keyboard = []
     row = []
@@ -326,6 +320,69 @@ def handle_text(chat_id, user_id, user_name, text):
     state = user.get('state', 'IDLE')
     uid_str = str(user_id)
 
+    # --- Custom Split Amount ---
+    if state == "WAITING_CUSTOM_SPLIT":
+        logger.info(f"WAITING_CUSTOM_SPLIT state: text={text}, user_id={user_id}")
+        try:
+            parts = text.replace(',', ' ').split()
+            logger.info(f"Parsed parts: {parts}")
+            amounts = [float(x) for x in parts]
+            logger.info(f"Parsed amounts: {amounts}")
+            
+            draft_id = user.get('draft_id')
+            logger.info(f"Draft ID from user state: {draft_id}")
+            draft = data.get_draft(draft_id)
+            if not draft: 
+                logger.warning(f"Draft not found for draft_id: {draft_id}")
+                refresh_menu_msg(chat_id, user_id, "⚠️ Время вышло или ошибка.", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню", "callback_data": "OPEN_DASHBOARD"}]]})
+                return
+
+            trip = data.get_trip(draft['trip_id'])
+            logger.info(f"Trip: {trip['name']} (ID: {draft['trip_id']})")
+            link_map = get_link_map()
+            logger.info(f"Link map: {link_map}")
+            masters = list(set(logic.get_master(m, link_map) for m in trip['members']))
+            masters.sort() 
+            logger.info(f"Calculated masters: {masters}, count: {len(masters)}")
+            
+            if len(amounts) != len(masters):
+                logger.warning(f"Mismatched amounts count: entered={len(amounts)}, expected={len(masters)}")
+                refresh_menu_msg(chat_id, user_id, f"❌ Нужно {len(masters)} сумм, а вы ввели {len(amounts)}. Попробуйте снова:", reply_markup={"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "OPEN_DASHBOARD"}]]})
+                return
+                
+            total_input = sum(amounts)
+            logger.info(f"Total input: {total_input}, Draft amount: {draft['amount']}")
+            if abs(total_input - draft['amount']) > 1.0:
+                logger.warning(f"Total input mismatch: entered={total_input}, expected={draft['amount']}")
+                refresh_menu_msg(chat_id, user_id, f"❌ Сумма не сходится! Чек: {draft['amount']}, ввели: {total_input}. Попробуйте снова:", reply_markup={"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "OPEN_DASHBOARD"}]]})
+                return
+                
+            split_map = {m_id: amt for m_id, amt in zip(masters, amounts) if amt > 0}
+            
+            new_exp = {
+                "id": int(time.time()),
+                "payer_id": draft['payer'],
+                "amount": draft['amount'],
+                "desc": draft['desc'],
+                "category": draft['category'],
+                "split": split_map,
+                "ts": time.time()
+            }
+            trip['expenses'].append(new_exp)
+            trips = data.load_json(data.TRIPS_FILE)
+            trips[draft['trip_id']] = trip
+            data.save_json(data.TRIPS_FILE, trips)
+            data.delete_draft(draft_id)
+            data.update_user_state(user_id, "IDLE")
+            
+            bot.send_message(chat_id, f"✅ Сохранено (вручную): *{draft['amount']}*")
+            send_trip_dashboard(chat_id, user_id)
+            notify_others(draft['trip_id'], draft['payer'], draft['amount'], draft['desc'], draft['category'], split_map)
+            
+        except ValueError:
+            refresh_menu_msg(chat_id, user_id, "❌ Введите числа через пробел:", reply_markup={"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "OPEN_DASHBOARD"}]]})
+        return
+
     # --- Trip Creation Flow ---
     if state == "WAITING_TRIP_NAME":
         name = text.strip()
@@ -394,7 +451,7 @@ def handle_text(chat_id, user_id, user_name, text):
             # Send notification as new message, then refresh menu
             bot.send_message(chat_id, f"✅ Вы вернули *{amount}* пользователю *{target_name}*.")
             bot.send_message(target_uid, f"💸 *{user_name}* вернул вам долг: *{amount}*")
-            send_trip_dashboard(chat_id, user_id) # Refresh
+            send_trip_dashboard(chat_id, user_id) 
             
         except ValueError: bot.send_message(chat_id, "❌ Введите число.")
         return
@@ -479,7 +536,7 @@ def handle_text(chat_id, user_id, user_name, text):
                 "category": "OTHER"
             }
             data.save_draft(draft_id, draft_data)
-            send_category_menu(chat_id, draft_id, curr) # This will use refresh_menu_msg inside
+            send_category_menu(chat_id, draft_id, curr) 
         except ValueError:
             pass 
 
@@ -615,6 +672,7 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         return
 
     if cmd == "BACK_MAIN":
+        data.update_user_state(user_id, "IDLE") # Ensure state is reset
         handle_command(chat_id, user_id, "User", "/start")
         return
 
@@ -657,6 +715,45 @@ def handle_callback(chat_id, user_id, message_id, data_str):
             send_split_menu(chat_id, draft_id, message_id)
         return
 
+    if cmd == "CUSTOM":
+        logger.info(f"User {user_id} clicked CUSTOM for draft_id: {parts[1]}")
+        draft_id = parts[1]
+        
+        # Save draft_id to user state so we know which draft we are editing
+        data.update_user_state(user_id, "WAITING_CUSTOM_SPLIT", draft_id=draft_id)
+        
+        # Show hint with names
+        draft = data.get_draft(draft_id)
+        if not draft:
+             bot.answer_callback_query(message_id, "Ошибка: черновик не найден.")
+             return
+
+        trip = data.get_trip(draft['trip_id'])
+        link_map = get_link_map()
+        
+        # Get unique masters (families)
+        masters = list(set(logic.get_master(m, link_map) for m in trip['members']))
+        masters.sort() 
+        
+        names = [data.get_linked_names(m) for m in masters]
+        
+        hint_lines = []
+        for i, name in enumerate(names):
+            hint_lines.append(f"{i+1}. *{name}*")
+        
+        hint_text = "\n".join(hint_lines)
+        curr = trip.get('currency', 'THB')
+        
+        msg = (
+            f"✏️ *Ручной ввод* (Всего: {draft['amount']} {curr})\n\n"
+            f"Введите суммы для участников *в этом порядке* (через пробел):\n"
+            f"{hint_text}\n\n"
+            f"Пример: `100 200 50`"
+        )
+        
+        bot.edit_message(chat_id, message_id, msg, reply_markup={"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "OPEN_DASHBOARD"}]]})
+        return
+
     if cmd == "CONFIRM":
         draft_id = parts[1]
         draft = data.get_draft(draft_id)
@@ -682,7 +779,6 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         data.save_json(data.TRIPS_FILE, trips)
         data.delete_draft(draft_id)
         
-        # Success message instead of menu (notification style)
         bot.edit_message(chat_id, message_id, f"✅ Сохранено: *{amount}* ({draft['desc']})", 
                          reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
         notify_others(tid, draft['payer'], amount, draft['desc'], draft['category'], split_map)
@@ -811,7 +907,6 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         curr = trip.get('currency', 'THB')
         hint = f"(Ваш текущий долг: *{debt_amount:,.0f} {curr}*)" if debt_amount > 0 else "(У вас нет долгов перед этим участником)"
         
-        # Here we use refresh_menu because we are prompting for text, and we want the prompt to be the "menu"
         refresh_menu_msg(chat_id, user_id, f"⌨️ Введите сумму возврата:\n{hint}", reply_markup={"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "OPEN_DASHBOARD"}]]})
         return
 
@@ -824,18 +919,14 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         victim_id = random.choice(masters)
         victim_name = data.get_linked_names(victim_id)
         
-        # Animation
         bot.edit_message(chat_id, message_id, f"🎲 *Крутим рулетку...*")
         time.sleep(1)
         
-        # Set state for victim
         data.update_user_state(victim_id, "WAITING_ROULETTE_AMOUNT", roulette_trip_id=tid, roulette_payer_id=victim_id)
         
-        # Result shown in the menu
         bot.edit_message(chat_id, message_id, f"🎯 Сегодня платит: *{victim_name.upper()}*! 🎉", 
                          reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
         
-        # Direct prompt to victim (as a fresh message to get attention)
         refresh_menu_msg(victim_id, victim_id, "🎉 Вы проиграли в рулетку! Введите сумму, которую оплатили:", reply_markup={"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "OPEN_DASHBOARD"}]]})
         return
 
