@@ -1,0 +1,23 @@
+{
+  "5976186394": {
+    "name": "Denis",
+    "active_trip_id": "trip_1771363682",
+    "joined_trips": [
+      "trip_1771363682"
+    ],
+    "state": "IDLE",
+    "partner_id": null,
+    "draft_id": "5976186394_1771363827",
+    "partner_invite_code": "KAAZI7"
+  },
+  "283754005": {
+    "name": "Anastasia",
+    "active_trip_id": "trip_1771363682",
+    "joined_trips": [
+      "trip_1771363682"
+    ],
+    "state": "IDLE",
+    "partner_id": null,
+    "repay_target": "5976186394"
+  }
+}

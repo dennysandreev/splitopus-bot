@@ -1,0 +1,10 @@
+# Data
+data/*.json
+*.log
+__pycache__/
+.env
+bot_token
+.DS_Store
+.idea/
+.vscode/
+venv/
