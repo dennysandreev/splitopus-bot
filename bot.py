@@ -9,7 +9,21 @@ from src import data, logic
 from src.telegram import TelegramClient
 
 # --- Configuration ---
-TOKEN = "8228071414:AAG31gr_raDybAdi_kNkyGZ8mpzBkiZX0VU"
+# Load environment variables from .env file (look in same dir as script)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+env_path = os.path.join(script_dir, ".env")
+
+if os.path.exists(env_path):
+    with open(env_path, "r") as f:
+        for line in f:
+            if "=" in line and not line.startswith("#"):
+                key, value = line.strip().split("=", 1)
+                os.environ[key] = value
+
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    print("Error: BOT_TOKEN not found in environment variables or .env file.")
+    exit(1)
 
 # --- Logging Setup ---
 logging.basicConfig(
