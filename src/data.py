@@ -103,3 +103,47 @@ def delete_draft(draft_id):
     if draft_id in drafts:
         del drafts[draft_id]
         save_json(DRAFTS_FILE, drafts)
+
+# --- Linkage / Family Operations ---
+def link_users(child_id, parent_id):
+    """
+    Links child_id to parent_id.
+    child_id will effectively use parent_id's balance.
+    """
+    users = load_json(USERS_FILE)
+    cid, pid = str(child_id), str(parent_id)
+    
+    if cid in users and pid in users:
+        users[cid]['linked_to'] = pid
+        save_json(USERS_FILE, users)
+        return True
+    return False
+
+def get_master_id(user_id):
+    """
+    Returns the ID of the wallet owner.
+    If user is linked, returns their parent's ID.
+    If user is independent, returns their own ID.
+    """
+    users = load_json(USERS_FILE)
+    uid = str(user_id)
+    user = users.get(uid)
+    
+    if user and user.get('linked_to'):
+        return user['linked_to']
+    return uid
+
+def get_linked_names(master_id):
+    """Returns a string like 'Denis + Anya' or just 'Denis'"""
+    users = load_json(USERS_FILE)
+    mid = str(master_id)
+    
+    names = [users.get(mid, {}).get('name', 'Unknown')]
+    
+    # Find children
+    for uid, u in users.items():
+        if u.get('linked_to') == mid:
+            names.append(u.get('name', 'Partner'))
+            
+    return " + ".join(names)
+

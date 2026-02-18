@@ -22,50 +22,62 @@ CURRENCIES = {
 }
 
 # --- Calculation Logic ---
-def calculate_balance(trip):
+def get_master(uid, link_map):
+    """Returns master ID from link_map or uid itself."""
+    return link_map.get(str(uid), str(uid))
+
+def calculate_balance(trip, link_map=None):
     """
-    Calculates balances for all members in a trip.
-    Returns: (balances, total_spent_on_trip, total_paid_by_member)
+    Calculates balances aggregating linked users.
+    link_map: { 'child_id': 'master_id', ... }
     """
-    if not trip: 
-        return {}, 0, {}
+    if not trip: return {}, 0, {}
+    if link_map is None: link_map = {}
     
-    balances = {uid: 0.0 for uid in trip['members']}
+    # Identify all unique masters involved
+    members = trip['members']
+    masters = set(get_master(uid, link_map) for uid in members)
+    
+    balances = {m: 0.0 for m in masters}
     total_spent_on_trip = 0.0
-    total_paid_by_member = {uid: 0.0 for uid in trip['members']}
+    total_paid_by_member = {m: 0.0 for m in masters}
     
     for exp in trip['expenses']:
         cat = exp.get('category', 'OTHER')
-        payer = str(exp['payer_id'])
+        
+        # Who physically paid -> Map to Master
+        real_payer = str(exp['payer_id'])
+        payer_master = get_master(real_payer, link_map)
+        
         amount = float(exp['amount'])
         
-        # 1. Total spent (excluding debt repayments)
         if cat != "REPAYMENT":
             total_spent_on_trip += amount
         
-        # 2. Total paid by each member (contributions)
-        if payer in total_paid_by_member:
-            total_paid_by_member[payer] += amount
+        if payer_master in total_paid_by_member:
+            total_paid_by_member[payer_master] += amount
         
-        # 3. Calculate balances (Who owes whom)
+        # Split processing
         split = exp['split']
-        if payer in balances: 
-            balances[payer] += amount
+        
+        # Payer gets credit (+)
+        if payer_master in balances: 
+            balances[payer_master] += amount
             
+        # Consumers get debit (-)
         for uid, share in split.items():
-            uid_str = str(uid)
-            if uid_str in balances: 
-                balances[uid_str] -= share
+            consumer_master = get_master(uid, link_map)
+            # If split is stored by master_id already, this is safe (get_master returns input if not in map)
+            if consumer_master in balances:
+                balances[consumer_master] -= share
             
     return balances, total_spent_on_trip, total_paid_by_member
 
-
-def get_my_stats(trip, my_uid):
-    """
-    Calculates personal statistics for a user in a trip.
-    """
-    if not trip: 
-        return {}
+def get_my_stats(trip, my_uid, link_map=None):
+    if not trip: return {}
+    if link_map is None: link_map = {}
+    
+    my_master = get_master(my_uid, link_map)
     
     stats = {
         "total_share": 0.0, 
@@ -73,39 +85,43 @@ def get_my_stats(trip, my_uid):
         "my_repayments": [], 
         "received_repayments": []
     }
-    my_uid = str(my_uid)
     
     for exp in trip['expenses']:
         cat = exp.get('category', 'OTHER')
-        payer = str(exp['payer_id'])
+        real_payer = str(exp['payer_id'])
+        payer_master = get_master(real_payer, link_map)
+        
         amount = float(exp['amount'])
-        desc = exp.get('desc', 'Расход')
         
         if cat == "REPAYMENT":
-            # I repaid a debt
-            if payer == my_uid:
-                target_uid = list(exp['split'].keys())[0]
-                stats["my_repayments"].append({"to": target_uid, "amount": amount, "ts": exp['ts']})
-            # Debt was repaid to me
-            elif my_uid in exp['split']:
-                stats["received_repayments"].append({"from": payer, "amount": amount, "ts": exp['ts']})
+            target_uid = list(exp['split'].keys())[0]
+            target_master = get_master(target_uid, link_map)
+            
+            if payer_master == my_master:
+                stats["my_repayments"].append({"to": target_master, "amount": amount, "ts": exp['ts']})
+            elif target_master == my_master:
+                stats["received_repayments"].append({"from": payer_master, "amount": amount, "ts": exp['ts']})
             continue 
         
         split = exp.get('split', {})
-        my_share = split.get(my_uid, 0.0)
         
+        # Calculate my share (aggregating if multiple sub-accounts involved in split?? 
+        # Usually split is stored as {master_id: share} now, so simple check)
+        my_share = split.get(my_master, 0.0)
+        
+        # Fallback: if split stored by individual IDs (old data)
+        if my_share == 0:
+            for uid, share in split.items():
+                if get_master(uid, link_map) == my_master:
+                    my_share += share
+
         if my_share > 0:
             stats["total_share"] += my_share
             stats["cats"][cat] = stats["cats"].get(cat, 0.0) + my_share
             
     return stats
 
-
 def simplify_debts(balances, user_names):
-    """
-    Optimizes debt transactions to minimize transfers.
-    Returns a list of transactions: [{'from': name, 'to': name, 'amount': X}, ...]
-    """
     creditors = []
     debtors = []
     
@@ -126,9 +142,13 @@ def simplify_debts(balances, user_names):
         
         amount = min(debtor['amount'], creditor['amount'])
         
+        # Use master names
+        from_name = user_names.get(debtor['id'], debtor['id'])
+        to_name = user_names.get(creditor['id'], creditor['id'])
+        
         transactions.append({
-            'from': user_names.get(debtor['id'], debtor['id']),
-            'to': user_names.get(creditor['id'], creditor['id']),
+            'from': from_name,
+            'to': to_name,
             'amount': amount
         })
         

@@ -26,22 +26,37 @@ logger = logging.getLogger(__name__)
 bot = TelegramClient(TOKEN)
 
 # --- Helper Functions ---
+def get_link_map():
+    users = data.load_json(data.USERS_FILE)
+    return {uid: u['linked_to'] for uid, u in users.items() if u.get('linked_to')}
+
 def notify_others(tid, payer_id, amount, desc, category, split_map):
     trip = data.get_trip(tid)
     if not trip: return
 
-    payer = data.get_user(payer_id)
-    payer_name = payer.get('name', 'User') if payer else 'User'
+    # Notify only masters involved (including payer's master)
+    link_map = get_link_map()
+    users_db = data.load_json(data.USERS_FILE)
+    
+    # Real payer name
+    payer_user = users_db.get(str(payer_id))
+    payer_name = payer_user.get('name', 'User') if payer_user else 'User'
     
     curr = trip.get('currency', 'THB')
     rate = trip.get('rate', 0)
     
     markup = {"inline_keyboard": [[{"text": "📊 Мой Баланс", "callback_data": "SHOW_MY_BALANCE"}]]}
     
-    for uid in trip['members']:
-        uid_str = str(uid)
-        if uid_str != str(payer_id):
-            my_share = split_map.get(uid_str, 0)
+    # Get all unique masters in trip
+    members = trip['members']
+    masters = set(logic.get_master(m, link_map) for m in members)
+    
+    payer_master = logic.get_master(payer_id, link_map)
+    
+    for mid in masters:
+        if mid != payer_master:
+            # Check if this master is involved in the split
+            my_share = split_map.get(mid, 0)
             if my_share > 0:
                 share_text = f"*{my_share:.0f} {curr}*"
                 if rate > 0: share_text += f" (~{my_share*rate:.0f} RUB)"
@@ -53,9 +68,9 @@ def notify_others(tid, payer_id, amount, desc, category, split_map):
                     f"{title}\n"
                     f"👤 *{payer_name}* -> *{amount:,.0f} {curr}*\n"
                     f"📝 {desc}\n"
-                    f"📉 {share_text}"
+                    f"📉 Ваша доля: {share_text}"
                 )
-                bot.send_message(uid_str, msg, reply_markup=markup)
+                bot.send_message(mid, msg, reply_markup=markup)
 
 def send_trip_dashboard(chat_id, user_id, message_id=None):
     uid_str = str(user_id)
@@ -68,9 +83,19 @@ def send_trip_dashboard(chat_id, user_id, message_id=None):
     name = trip.get('name', 'Trip')
     code = trip.get('code')
     
+    # Check linkage
+    link_map = get_link_map()
+    master_id = logic.get_master(user_id, link_map)
+    is_linked = (master_id != uid_str)
+    
+    role_info = ""
+    if is_linked:
+        master_name = data.load_json(data.USERS_FILE).get(master_id, {}).get('name', 'Master')
+        role_info = f"\n🔗 Вы привязаны к: *{master_name}*"
+    
     msg = (
         f"🌴 *Поездка: {name}*\n"
-        f"🔑 Код: `{code}`\n\n"
+        f"🔑 Код: `{code}`{role_info}\n\n"
         "✍️ *Чтобы добавить трату:*\n"
         "Просто напишите сумму и название в этот чат.\n"
         "Пример: `500 Обед` или `200 Такси`\n\n"
@@ -84,7 +109,6 @@ def send_trip_dashboard(chat_id, user_id, message_id=None):
             [{"text": "📜 История трат", "callback_data": "MENU_ALL_EXPENSES"}],
             [{"text": "📝 Заметки", "callback_data": "MENU_NOTES"}, {"text": "💾 Скачать отчет", "callback_data": "MENU_EXPORT"}],
             [{"text": "🔙 Назад к списку", "callback_data": "MENU_TRIPS"}, {"text": "📖 Инструкция", "callback_data": "SHOW_HELP"}],
-            # [{"text": "👫 Пригласить партнера", "callback_data": "MENU_INVITE_PARTNER"}] # Disabled for now
         ]
     }
     
@@ -123,20 +147,32 @@ def send_split_menu(chat_id, draft_id, message_id=None):
     amount = draft['amount']
     desc = draft['desc']
     cat = draft.get('category', '')
-    selected = draft['selected']
+    selected = draft['selected'] # Now stores {master_id: True/False}
     
     keyboard = []
     row = []
     
     users_db = data.load_json(data.USERS_FILE)
     
-    for uid, is_active in selected.items():
-        u_name = users_db.get(str(uid), {}).get('name', 'Unknown')
+    # Identify unique masters in the trip
+    members = trip['members']
+    masters = set()
+    for m in members:
+        # Get master ID (or self if not linked)
+        master_id = users_db.get(str(m), {}).get('linked_to') or str(m)
+        masters.add(master_id)
+        
+    for mid in masters:
+        # Generate display name (e.g. "Denis + Anya")
+        display_name = data.get_linked_names(mid)
+        
+        # Check status (default True if not set)
+        is_active = selected.get(mid, True)
         status = "✅" if is_active else "⬜️"
-        row.append({"text": f"{status} {u_name}", "callback_data": f"TOGGLE|{draft_id}|{uid}"})
-        if len(row) == 2: keyboard.append(row); row = []
-    if row: keyboard.append(row)
-    
+        
+        # Use single column for better readability of long names
+        keyboard.append([{"text": f"{status} {display_name}", "callback_data": f"TOGGLE|{draft_id}|{mid}"}])
+            
     count = sum(1 for v in selected.values() if v)
     share = amount / count if count > 0 else 0
     
@@ -144,7 +180,7 @@ def send_split_menu(chat_id, draft_id, message_id=None):
     keyboard.append([{"text": "✏️ Ввести вручную", "callback_data": f"CUSTOM|{draft_id}"}])
     keyboard.append([{"text": "❌ Отмена", "callback_data": f"CANCEL|{draft_id}"}])
     
-    text = f"💸 *{amount} {curr}* ({desc})\n🏷 {cat}\nКто участвует?"
+    text = f"💸 *{amount} {curr}* ({desc})\n🏷 {cat}\nКто участвует (семьями)?"
     markup = {"inline_keyboard": keyboard}
     
     if message_id: bot.edit_message(chat_id, message_id, text, reply_markup=markup)
@@ -203,9 +239,6 @@ def send_all_expenses_list(chat_id, user_id, message_id=None, page=0):
     else: bot.send_message(chat_id, msg, reply_markup={"inline_keyboard": keyboard_rows})
 
 def send_recent_expenses(chat_id, user_id, message_id=None):
-    # Reuse list logic with limited items, but for now simple implementation
-    # Actually, can just reuse the list function or keep it separate for "Top 10"
-    # Let's implementation simpler version
     send_all_expenses_list(chat_id, user_id, message_id, page=0)
 
 # --- Handlers ---
@@ -288,32 +321,91 @@ def handle_text(chat_id, user_id, user_name, text):
     if state == "WAITING_TRIP_CODE":
         code = text.strip().upper()
         trips = data.load_json(data.TRIPS_FILE)
-        users = data.load_json(data.USERS_FILE)
         
         found_tid = None
         for tid, t in trips.items():
             if t['code'] == code: found_tid = tid; break
             
         if found_tid:
-            users[uid_str]['active_trip_id'] = found_tid
-            if 'joined_trips' not in users[uid_str]: users[uid_str]['joined_trips'] = []
-            if found_tid not in users[uid_str]['joined_trips']: users[uid_str]['joined_trips'].append(found_tid)
-            users[uid_str]['state'] = "IDLE"
+            # Save temp trip ID and ask for role
+            data.update_user_state(user_id, "WAITING_ROLE_SELECTION", temp_trip_id=found_tid)
             
-            if uid_str not in trips[found_tid]['members']:
-                trips[found_tid]['members'].append(uid_str)
-                for m in trips[found_tid]['members']:
-                    if m != uid_str: bot.send_message(m, f"👋 *{user_name}* присоединился!")
-            
-            data.save_json(data.USERS_FILE, users)
-            data.save_json(data.TRIPS_FILE, trips)
-            
-            bot.send_message(chat_id, f"✅ Вы присоединились! Активная поездка: `{trips[found_tid].get('name')}`")
-            send_trip_dashboard(chat_id, user_id)
+            trip_name = trips[found_tid].get('name', 'Trip')
+            msg = (
+                f"🎉 Код принят! Поездка: *{trip_name}*\n\n"
+                "Как вы хотите присоединиться?\n"
+                "👤 **Я самостоятельный участник** — буду платить за себя (или за семью).\n"
+                "💞 **Присоединиться к партнеру** — у нас общий бюджет с кем-то, кто уже здесь."
+            )
+            keyboard = {"inline_keyboard": [
+                [{"text": "👤 Я самостоятельный участник", "callback_data": "JOIN_SOLO"}],
+                [{"text": "💞 Присоединиться к партнеру", "callback_data": "JOIN_LINKED"}]
+            ]}
+            bot.send_message(chat_id, msg, reply_markup=keyboard)
         else:
             bot.send_message(chat_id, "❌ Неверный код.")
         return
 
+    # --- Roulette Amount ---
+    if state == "WAITING_ROULETTE_AMOUNT":
+        try:
+            amount = float(text)
+            tid = user.get('roulette_trip_id')
+            payer_id = user.get('roulette_payer_id')
+
+            if not tid or not payer_id:
+                bot.send_message(chat_id, "⚠️ Ошибка с рулеткой. Попробуйте снова.")
+                data.update_user_state(user_id, "IDLE")
+                return
+
+            trip = data.get_trip(tid)
+            
+            # Roulette Logic: The loser PAYS for everyone effectively as a gift.
+            # In accounting terms: Payer pays X, and Payer consumes X. 
+            # Debt to others is 0. 
+            
+            # Or should we just NOT record it in shared balance but track it in stats?
+            # Current logic: Payer = Victim. Split = {Victim: Amount}. 
+            # Result: Victim spent money, balance unchanged vs group.
+            
+            link_map = get_link_map()
+            payer_master = logic.get_master(payer_id, link_map)
+            split_map = {payer_master: amount}
+
+            new_exp = {
+                "id": int(time.time()),
+                "payer_id": payer_id, 
+                "amount": amount,
+                "desc": "Рулетка (Угощение) 🎁",
+                "category": "FUN", 
+                "split": split_map,
+                "ts": time.time()
+            }
+            
+            trip['expenses'].append(new_exp)
+            
+            # Save
+            trips = data.load_json(data.TRIPS_FILE)
+            trips[tid] = trip
+            data.save_json(data.TRIPS_FILE, trips)
+
+            data.update_user_state(user_id, "IDLE")
+
+            bot.send_message(chat_id, f"✅ Угощение на *{amount}* записано! (Долги не начислены)", reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
+            
+            # Notify others manually since notify_others might be confusing with "Your share: 0"
+            users_db = data.load_json(data.USERS_FILE)
+            payer_name = users_db.get(str(payer_id), {}).get('name', 'User')
+            curr = trip.get('currency', 'THB')
+            
+            for m in trip['members']:
+                if str(m) != str(payer_id):
+                    bot.send_message(m, f"🎁 *Рулетка!* \n*{payer_name}* угостил всех на сумму *{amount} {curr}*! 🥳")
+
+        except ValueError:
+            bot.send_message(chat_id, "❌ Введите числовое значение суммы.")
+        return
+    
     # --- Repayment Amount ---
     if state == "WAITING_REPAYMENT_AMOUNT":
         try:
@@ -375,7 +467,11 @@ def handle_text(chat_id, user_id, user_name, text):
             
             draft_id = f"{user_id}_{int(time.time())}"
             members = trip['members']
-            selected = {m: True for m in members}
+            
+            # Select all MASTERS by default
+            link_map = get_link_map()
+            masters = set(logic.get_master(m, link_map) for m in members)
+            selected = {m: True for m in masters}
             
             draft_data = {
                 "amount": amount,
@@ -408,6 +504,108 @@ def handle_callback(chat_id, user_id, message_id, data_str):
     if cmd == "MENU_JOIN":
         data.update_user_state(user_id, "WAITING_TRIP_CODE")
         bot.send_message(chat_id, "⌨️ Введите код:")
+        return
+
+    # --- Joining Logic ---
+    if cmd == "JOIN_SOLO":
+        user = data.get_user(user_id)
+        tid = user.get('temp_trip_id')
+        if not tid: return bot.send_message(chat_id, "⚠️ Ошибка сессии. Введите код заново.")
+        
+        users = data.load_json(data.USERS_FILE)
+        trips = data.load_json(data.TRIPS_FILE)
+        
+        users[uid_str]['active_trip_id'] = tid
+        if 'joined_trips' not in users[uid_str]: users[uid_str]['joined_trips'] = []
+        if tid not in users[uid_str]['joined_trips']: users[uid_str]['joined_trips'].append(tid)
+        users[uid_str]['state'] = "IDLE"
+        if 'temp_trip_id' in users[uid_str]: del users[uid_str]['temp_trip_id']
+        
+        if uid_str not in trips[tid]['members']:
+            trips[tid]['members'].append(uid_str)
+            for m in trips[tid]['members']:
+                if m != uid_str: bot.send_message(m, f"👋 *{users[uid_str].get('name')}* присоединился!")
+                
+        data.save_json(data.USERS_FILE, users)
+        data.save_json(data.TRIPS_FILE, trips)
+        
+        bot.send_message(chat_id, f"✅ Вы присоединились! Активная поездка: `{trips[tid].get('name')}`")
+        send_trip_dashboard(chat_id, user_id)
+        return
+
+    if cmd == "JOIN_LINKED":
+        user = data.get_user(user_id)
+        tid = user.get('temp_trip_id')
+        if not tid: return
+        
+        trip = data.get_trip(tid)
+        users_db = data.load_json(data.USERS_FILE)
+        
+        keyboard = []
+        for mid in trip['members']:
+            if mid == uid_str: continue
+            m_user = users_db.get(str(mid), {})
+            if not m_user.get('linked_to'):
+                name = m_user.get('name', 'Unknown')
+                keyboard.append([{"text": f"К {name}", "callback_data": f"REQ_LINK|{mid}"}])
+        
+        keyboard.append([{"text": "🔙 Отмена (я сам)", "callback_data": "JOIN_SOLO"}])
+        bot.edit_message(chat_id, message_id, "💞 Выберите, к кому присоединиться (кто будет платить):", reply_markup={"inline_keyboard": keyboard})
+        return
+
+    if cmd == "REQ_LINK":
+        target_id = parts[1]
+        user = data.get_user(user_id)
+        tid = user.get('temp_trip_id')
+        my_name = user.get('name', 'User')
+        
+        msg = (
+            f"🔔 *Запрос на привязку*\n"
+            f"Пользователь *{my_name}* хочет присоединиться к вашему счету.\n"
+            "Если вы примете, вы будете платить за двоих."
+        )
+        keyboard = {"inline_keyboard": [
+            [{"text": "✅ Принять", "callback_data": f"APPROVE_LINK|{user_id}|{tid}"}],
+            [{"text": "❌ Отклонить", "callback_data": f"REJECT_LINK|{user_id}"}]
+        ]}
+        bot.send_message(target_id, msg, reply_markup=keyboard)
+        bot.edit_message(chat_id, message_id, "⏳ Запрос отправлен! Ждем подтверждения...")
+        return
+
+    if cmd == "APPROVE_LINK":
+        child_id = parts[1]
+        tid = parts[2]
+        data.link_users(child_id, user_id)
+        
+        users = data.load_json(data.USERS_FILE)
+        trips = data.load_json(data.TRIPS_FILE)
+        child_str = str(child_id)
+        
+        users[child_str]['active_trip_id'] = tid
+        if 'joined_trips' not in users[child_str]: users[child_str]['joined_trips'] = []
+        if tid not in users[child_str]['joined_trips']: users[child_str]['joined_trips'].append(tid)
+        users[child_str]['state'] = "IDLE"
+        if 'temp_trip_id' in users[child_str]: del users[child_str]['temp_trip_id']
+        
+        if child_str not in trips[tid]['members']:
+            trips[tid]['members'].append(child_str)
+            
+        data.save_json(data.USERS_FILE, users)
+        data.save_json(data.TRIPS_FILE, trips)
+        
+        child_name = users[child_str].get('name', 'Partner')
+        master_name = users[str(user_id)].get('name', 'Master')
+        
+        bot.edit_message(chat_id, message_id, f"✅ Вы приняли *{child_name}*! Теперь у вас общий счет.")
+        bot.send_message(child_id, f"✅ *{master_name}* принял запрос! Ваши счета объединены.")
+        send_trip_dashboard(child_id, child_id)
+        return
+
+    if cmd == "REJECT_LINK":
+        child_id = parts[1]
+        bot.edit_message(chat_id, message_id, "❌ Запрос отклонен.")
+        bot.send_message(child_id, "❌ Запрос отклонен. Попробуйте войти как самостоятельный участник.", 
+                         reply_markup={"inline_keyboard": [[{"text": "Попробовать снова", "callback_data": "BACK_MAIN"}]]})
         return
 
     if cmd == "MENU_TRIPS":
@@ -473,10 +671,10 @@ def handle_callback(chat_id, user_id, message_id, data_str):
 
     if cmd == "TOGGLE":
         draft_id = parts[1]
-        target_uid = parts[2]
+        target_mid = parts[2] # Changed to master_id
         draft = data.get_draft(draft_id)
         if draft:
-            draft['selected'][target_uid] = not draft['selected'].get(target_uid, False)
+            draft['selected'][target_mid] = not draft['selected'].get(target_mid, False)
             data.save_draft(draft_id, draft)
             send_split_menu(chat_id, draft_id, message_id)
         return
@@ -493,7 +691,9 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         
         amount = draft['amount']
         share = amount / count
-        split_map = {uid: share for uid, active in selected.items() if active}
+        
+        # Save split as {master_id: share}
+        split_map = {mid: share for mid, active in selected.items() if active}
         
         new_exp = {
             "id": int(time.time()),
@@ -512,6 +712,7 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         
         bot.edit_message(chat_id, message_id, f"✅ Сохранено: *{amount}* ({draft['desc']})", 
                          reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
+        
         notify_others(tid, draft['payer'], amount, draft['desc'], draft['category'], split_map)
         return
 
@@ -528,10 +729,15 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         tid = data.get_active_trip_id(user_id)
         if not tid: return
         trip = data.get_trip(tid)
+        link_map = get_link_map()
         
-        balances, total_spent, total_paid = logic.calculate_balance(trip)
+        balances, total_spent, total_paid = logic.calculate_balance(trip, link_map)
         users_db = data.load_json(data.USERS_FILE)
-        names = {uid: users_db.get(uid, {}).get('name', 'Unknown') for uid in trip['members']}
+        
+        # Get names only for masters
+        names = {}
+        for uid in balances.keys():
+            names[uid] = data.get_linked_names(uid)
         
         curr = trip.get('currency', 'THB')
         report = f"📊 *Баланс ({trip.get('name')}):*\n"
@@ -561,10 +767,14 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         tid = data.get_active_trip_id(user_id)
         if not tid: return
         trip = data.get_trip(tid)
+        link_map = get_link_map()
         
-        balances, _, _ = logic.calculate_balance(trip)
+        balances, _, _ = logic.calculate_balance(trip, link_map)
         users_db = data.load_json(data.USERS_FILE)
-        names = {uid: users_db.get(uid, {}).get('name', 'Unknown') for uid in trip['members']}
+        names = {}
+        for uid in balances.keys():
+            names[uid] = data.get_linked_names(uid)
+            
         curr = trip.get('currency', 'THB')
         rate = trip.get('rate', 0)
         
@@ -582,9 +792,10 @@ def handle_callback(chat_id, user_id, message_id, data_str):
             amount_str = f"*{amount:,.0f} {curr}*"
             if rate > 0: amount_str += f" (~{amount*rate:,.0f} RUB)"
 
-            # Find IDs by name (a bit inefficient but works for small groups)
-            from_id = next((uid for uid, name in names.items() if name == from_name), None)
-            to_id = next((uid for uid, name in names.items() if name == to_name), None)
+            # Need to find master IDs by name to send messages
+            # Inefficient but simple lookup
+            from_id = next((uid for uid, n in names.items() if n == from_name), None)
+            to_id = next((uid for uid, n in names.items() if n == to_name), None)
 
             if from_id:
                 bot.send_message(from_id, f"💸 Вам необходимо перевести *{amount_str}* пользователю *{to_name}*.")
@@ -598,11 +809,13 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         tid = data.get_active_trip_id(user_id)
         if not tid: return
         trip = data.get_trip(tid)
-        stats = logic.get_my_stats(trip, uid_str)
+        link_map = get_link_map()
+        
+        stats = logic.get_my_stats(trip, uid_str, link_map)
         curr = trip.get('currency', 'THB')
         
         report = f"👤 *Ваша статистика ({trip.get('name')}):*\n\n"
-        report += f"💰 *Всего потрачено вами: {stats['total_share']:.0f} {curr}*\n"
+        report += f"💰 *Всего потрачено (на семью): {stats['total_share']:.0f} {curr}*\n"
         
         if stats['cats']:
             report += "*Траты по категориям:*\n"
@@ -617,13 +830,17 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         tid = data.get_active_trip_id(user_id)
         if not tid: return
         trip = data.get_trip(tid)
-        users_db = data.load_json(data.USERS_FILE)
+        
+        # Show masters to repay to
+        link_map = get_link_map()
+        my_master = logic.get_master(user_id, link_map)
+        masters = set(logic.get_master(m, link_map) for m in trip['members'])
         
         keyboard = []
-        for uid in trip['members']:
-            if str(uid) != uid_str:
-                name = users_db.get(str(uid), {}).get('name', 'Unknown')
-                keyboard.append([{"text": f"Вернуть {name}", "callback_data": f"REPAY_TO|{uid}"}])
+        for mid in masters:
+            if mid != my_master:
+                name = data.get_linked_names(mid)
+                keyboard.append([{"text": f"Вернуть {name}", "callback_data": f"REPAY_TO|{mid}"}])
         
         keyboard.append([{"text": "🔙 Назад", "callback_data": "OPEN_DASHBOARD"}])
         bot.edit_message(chat_id, message_id, "💸 Кому вы вернули долг?", reply_markup={"inline_keyboard": keyboard})
@@ -632,23 +849,59 @@ def handle_callback(chat_id, user_id, message_id, data_str):
     if cmd == "REPAY_TO":
         target_uid = parts[1]
         data.update_user_state(user_id, "WAITING_REPAYMENT_AMOUNT", repay_target=target_uid)
-        bot.send_message(chat_id, "⌨️ Введите сумму возврата:")
+        
+        # Calculate current debt to this person
+        tid = data.get_active_trip_id(user_id)
+        trip = data.get_trip(tid)
+        link_map = get_link_map()
+        
+        balances, _, _ = logic.calculate_balance(trip, link_map)
+        users_db = data.load_json(data.USERS_FILE)
+        
+        # Prepare names map for simplify_debts
+        names = {}
+        for uid in balances.keys():
+            names[uid] = uid # Use IDs to find exact match
+            
+        txs = logic.simplify_debts(balances, names)
+        
+        my_master = logic.get_master(user_id, link_map)
+        target_master = logic.get_master(target_uid, link_map)
+        
+        debt_amount = 0
+        for t in txs:
+            if t['from'] == my_master and t['to'] == target_master:
+                debt_amount = t['amount']
+                break
+        
+        curr = trip.get('currency', 'THB')
+        hint = f"(Ваш текущий долг: *{debt_amount:,.0f} {curr}*)" if debt_amount > 0 else "(У вас нет долгов перед этим участником)"
+        
+        bot.send_message(chat_id, f"⌨️ Введите сумму возврата:\n{hint}")
         return
 
     if cmd == "MENU_ROULETTE":
         tid = data.get_active_trip_id(user_id)
         if not tid: return
         trip = data.get_trip(tid)
-        members = trip['members']
-        users_db = data.load_json(data.USERS_FILE)
         
-        victim_id = random.choice(members)
-        victim_name = users_db.get(str(victim_id), {}).get('name', 'Someone')
+        # Roulette selects from MASTERS
+        link_map = get_link_map()
+        masters = list(set(logic.get_master(m, link_map) for m in trip['members']))
         
+        victim_id = random.choice(masters)
+        victim_name = data.get_linked_names(victim_id)
+        
+        # Set state for the VICTIM
+        data.update_user_state(victim_id, "WAITING_ROULETTE_AMOUNT", roulette_trip_id=tid, roulette_payer_id=victim_id)
+
         bot.send_message(chat_id, f"🎲 *Крутим рулетку...*")
         time.sleep(1)
         bot.send_message(chat_id, f"🎯 Сегодня платит: *{victim_name.upper()}*! 🎉", 
                          reply_markup={"inline_keyboard": [[{"text": "🔙 К меню поездки", "callback_data": "OPEN_DASHBOARD"}]]})
+        
+        # Notify victim specifically
+        bot.send_message(victim_id, "🎉 Вы проиграли в рулетку! Введите сумму, которую оплатили:")
         return
 
     if cmd == "MENU_ALL_EXPENSES":
@@ -706,7 +959,24 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         return
     
     if cmd == "SHOW_HELP":
-        help_text = "📖 *Справка:*\nПиши сумму и название: `500 Обед`.\nИспользуй меню для остального."
+        help_text = (
+            "📖 *Как пользоваться Splitopus*\n\n"
+            "💸 *Добавление трат:*\n"
+            "Просто напишите сумму и название в чат.\n"
+            "Пример: `500 Обед` или `1200 Такси`.\n"
+            "Бот предложит выбрать категорию и участников.\n\n"
+            "💞 *Партнеры (Семейный счет):*\n"
+            "Если вы в поездке парой, один может присоединиться к другому (через код поездки -> Присоединиться к партнеру). "
+            "Тогда у вас будет общий баланс, и в списках вы будете отображаться как одна семья.\n\n"
+            "📊 *Баланс и Долги:*\n"
+            "Нажмите **Баланс**, чтобы увидеть, кто сколько потратил и кто кому должен. "
+            "Кнопка **Сделать расчет** пришлет всем уведомления о долгах.\n\n"
+            "🎲 *Рулетка:*\n"
+            "Не можете решить, кто платит за ужин? Рулетка выберет счастливчика! "
+            "Этот расход считается как **угощение** (подарок) от плательщика и не создает долгов у остальных.\n\n"
+            "🔄 *Возврат долга:*\n"
+            "Если вы перевели деньги другу, нажмите **Вернуть долг**, выберите его и введите сумму. Это уменьшит ваш долг в системе."
+        )
         bot.send_message(chat_id, help_text, reply_markup={"inline_keyboard": [[{"text": "🔙 К меню", "callback_data": "OPEN_DASHBOARD"}]]})
         return
 
