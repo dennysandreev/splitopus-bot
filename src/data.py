@@ -133,6 +133,17 @@ def get_master_id(user_id):
         return user['linked_to']
     return uid
 
+def get_user_menu_id(user_id):
+    user = get_user(user_id)
+    return user.get('menu_msg_id') if user else None
+
+def set_user_menu_id(user_id, msg_id):
+    users = load_json(USERS_FILE)
+    uid = str(user_id)
+    if uid in users:
+        users[uid]['menu_msg_id'] = msg_id
+        save_json(USERS_FILE, users)
+
 def get_linked_names(master_id):
     """Returns a string like 'Denis + Anya' or just 'Denis'"""
     users = load_json(USERS_FILE)

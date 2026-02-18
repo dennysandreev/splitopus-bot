@@ -90,6 +90,9 @@ class TelegramClient:
             payload['reply_markup'] = json.dumps(reply_markup) if isinstance(reply_markup, dict) else reply_markup
         return self._request("POST", "editMessageText", json_data=payload)
 
+    def delete_message(self, chat_id, message_id):
+        return self._request("POST", "deleteMessage", json_data={"chat_id": chat_id, "message_id": message_id})
+
     def send_document(self, chat_id, file_path):
         try:
             with open(file_path, 'rb') as f:
