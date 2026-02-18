@@ -8,3 +8,4 @@ bot_token
 .idea/
 .vscode/
 venv/
+.venv/
