@@ -90,13 +90,19 @@ def get_all_users_as_dict():
         users[d['id']] = d
     return users
 
-def get_linked_names(master_id):
+def get_linked_names(master_id, filter_ids=None):
     conn = get_connection()
     mid = str(master_id)
     master = conn.execute("SELECT name FROM users WHERE id = ?", (mid,)).fetchone()
     master_name = master['name'] if master else 'Unknown'
-    children = conn.execute("SELECT name FROM users WHERE linked_to = ?", (mid,)).fetchall()
-    child_names = [c['name'] for c in children]
+    children = conn.execute("SELECT id, name FROM users WHERE linked_to = ?", (mid,)).fetchall()
+    
+    child_names = []
+    for c in children:
+        # Если задан фильтр, показываем только тех, кто в фильтре
+        if filter_ids is None or c['id'] in filter_ids:
+            child_names.append(c['name'])
+            
     all_names = [master_name] + child_names
     conn.close()
     return " + ".join(all_names)

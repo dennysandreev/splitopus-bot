@@ -188,7 +188,7 @@ def send_split_menu(chat_id, draft_id, message_id=None):
         masters.add(master_id)
         
     for mid in masters:
-        display_name = data.get_linked_names(mid)
+        display_name = data.get_linked_names(mid, filter_ids=[str(m) for m in members])
         is_active = selected.get(mid, True)
         status = "✅" if is_active else "⬜️"
         keyboard.append([{"text": f"{status} {display_name}", "callback_data": f"TOGGLE|{draft_id}|{mid}"}])
@@ -684,7 +684,7 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         masters = list(set(logic.get_master(m, link_map) for m in trip['members']))
         masters.sort() 
         
-        names = [data.get_linked_names(m) for m in masters]
+        names = [data.get_linked_names(m, filter_ids=[str(u) for u in trip['members']]) for m in masters]
         
         hint_lines = []
         for i, name in enumerate(names):
@@ -737,9 +737,10 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         link_map = get_link_map()
         balances, total_spent, total_paid = logic.calculate_balance(trip, link_map)
         
+        trip_members_str = [str(m) for m in trip['members']]
         names = {}
         for uid in balances.keys():
-            names[uid] = data.get_linked_names(uid)
+            names[uid] = data.get_linked_names(uid, filter_ids=trip_members_str)
         curr = trip.get('currency', 'THB')
         report = f"📊 *Баланс ({trip.get('name')}):*\n"
         report += f"💰 Всего: *{total_spent:,.0f} {curr}*\n\n"
@@ -768,9 +769,10 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         link_map = get_link_map()
         balances, _, _ = logic.calculate_balance(trip, link_map)
         
+        trip_members_str = [str(m) for m in trip['members']]
         names = {}
         for uid in balances.keys():
-            names[uid] = data.get_linked_names(uid)
+            names[uid] = data.get_linked_names(uid, filter_ids=trip_members_str)
         curr = trip.get('currency', 'THB')
         rate = trip.get('rate', 0)
         txs = logic.simplify_debts(balances, names)
@@ -828,9 +830,10 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         my_master = logic.get_master(user_id, link_map)
         masters = set(logic.get_master(m, link_map) for m in trip['members'])
         keyboard = []
+        trip_members_str = [str(m) for m in trip['members']]
         for mid in masters:
             if mid != my_master:
-                name = data.get_linked_names(mid)
+                name = data.get_linked_names(mid, filter_ids=trip_members_str)
                 keyboard.append([{"text": f"Вернуть {name}", "callback_data": f"REPAY_TO|{mid}"}])
         keyboard.append([{"text": "🔙 Назад", "callback_data": "OPEN_DASHBOARD"}])
         bot.edit_message(chat_id, message_id, "💸 Кому вы вернули долг?", reply_markup={"inline_keyboard": keyboard})
@@ -868,7 +871,7 @@ def handle_callback(chat_id, user_id, message_id, data_str):
         link_map = get_link_map()
         masters = list(set(logic.get_master(m, link_map) for m in trip['members']))
         victim_id = random.choice(masters)
-        victim_name = data.get_linked_names(victim_id)
+        victim_name = data.get_linked_names(victim_id, filter_ids=[str(m) for m in trip['members']])
         
         bot.edit_message(chat_id, message_id, f"🎲 *Крутим рулетку...*")
         time.sleep(1)
