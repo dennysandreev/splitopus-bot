@@ -51,8 +51,8 @@ def get_user_menu_id(user_id):
 def set_user_menu_id(user_id, msg_id):
     db.set_user_menu_id(user_id, msg_id)
     
-def get_linked_names(master_id):
-    return db.get_linked_names(master_id)
+def get_linked_names(master_id, filter_ids=None):
+    return db.get_linked_names(master_id, filter_ids=filter_ids)
 
 def get_all_users_as_dict():
     return db.get_all_users_as_dict()
